@@ -2,7 +2,11 @@ import os
 import ccxt
 from dotenv import load_dotenv
 
-load_dotenv()
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+dotenv_path = os.path.join(base_dir, '.env')
+load_dotenv(dotenv_path)
+
+# 代理要求：币安允许以下地区的 IP 访问：香港、日本、新加坡、韩国、欧洲多数国家等。测试显示日本可以。
 
 # 配置代理 - 请将端口号替换成你代理软件的端口
 proxies = {
