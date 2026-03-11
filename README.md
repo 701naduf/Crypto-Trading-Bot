@@ -35,7 +35,7 @@ Crypto-Trading-Bot/
 │   ├── backfill.py              # 历史数据回填
 │   ├── check_data.py            # 数据质量巡检
 │   └── status.py                # 查看所有采集脚本运行状态
-├── tests/                       # 单元测试（82 项）
+├── tests/                       # 单元测试（125 项）
 ├── db/                          # 数据存储（.gitignore）
 ├── logs/                        # 日志 + 状态文件（.gitignore）
 ├── requirements.txt
@@ -121,7 +121,7 @@ python -m scripts.check_data
 python -m pytest tests/ -v
 ```
 
-预期结果：82 项全部通过。
+预期结果：125 项全部通过。
 
 ### 测试分类
 

@@ -92,6 +92,7 @@ class MarketFetcher:
             "enableRateLimit": True,
             "options": {
                 "defaultType": "future",  # 使用合约 API
+                "fetchCurrencies": False,  # 禁用 SAPI 货币请求，避免不可达端点
             },
         }
 
@@ -169,8 +170,9 @@ class MarketFetcher:
         futures_symbol = _to_futures_symbol(symbol)
         binance_symbol = _to_binance_symbol(symbol)
 
-        # 使用 Binance 的 fapiPublicGetOpenInterest 接口
-        response = self.exchange.fapi_public_get_open_interest({
+        # 使用 Binance 的 fapiPublicGetOpenInterest 隐式方法
+        # ccxt v4 只保留 camelCase 命名，分区为 fapiPublic
+        response = self.exchange.fapiPublicGetOpenInterest({
             "symbol": binance_symbol,
         })
 
@@ -213,8 +215,9 @@ class MarketFetcher:
         """
         binance_symbol = _to_binance_symbol(symbol)
 
-        # 使用 ccxt 的通用 API 调用
-        response = self.exchange.fapi_public_get_toplongshortpositionratio({
+        # ccxt v4 隐式方法：fapiData 分区 + camelCase 命名
+        # 对应 Binance API: /futures/data/topLongShortPositionRatio
+        response = self.exchange.fapiDataGetTopLongShortPositionRatio({
             "symbol": binance_symbol,
             "period": period,
             "limit": limit,
@@ -259,7 +262,9 @@ class MarketFetcher:
         """
         binance_symbol = _to_binance_symbol(symbol)
 
-        response = self.exchange.fapi_public_get_takerlongshort_ratio({
+        # ccxt v4 隐式方法：fapiData 分区 + camelCase 命名
+        # 对应 Binance API: /futures/data/takerlongshortRatio
+        response = self.exchange.fapiDataGetTakerlongshortRatio({
             "symbol": binance_symbol,
             "period": period,
             "limit": limit,

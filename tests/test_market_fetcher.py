@@ -82,7 +82,7 @@ class TestFetchFundingRate:
 class TestFetchOpenInterest:
     def test_returns_dict_with_symbol(self, fetcher):
         """返回 dict 应包含 symbol 键"""
-        fetcher.exchange.fapi_public_get_open_interest.return_value = {
+        fetcher.exchange.fapiPublicGetOpenInterest.return_value = {
             "openInterest": "1234.56",
         }
         fetcher.exchange.fetch_ticker.return_value = {"last": 42000.0}
@@ -96,7 +96,7 @@ class TestFetchOpenInterest:
 
     def test_zero_price(self, fetcher):
         """价格为 0 时持仓价值应为 0"""
-        fetcher.exchange.fapi_public_get_open_interest.return_value = {
+        fetcher.exchange.fapiPublicGetOpenInterest.return_value = {
             "openInterest": "100.0",
         }
         fetcher.exchange.fetch_ticker.return_value = {"last": 0}
@@ -109,7 +109,7 @@ class TestFetchOpenInterest:
 class TestFetchLongShortRatio:
     def test_returns_dataframe_with_symbol(self, fetcher):
         """返回 DataFrame 应包含 symbol 列"""
-        fetcher.exchange.fapi_public_get_toplongshortpositionratio.return_value = [
+        fetcher.exchange.fapiDataGetTopLongShortPositionRatio.return_value = [
             {
                 "timestamp": "1705305600000",
                 "longAccount": "0.55",
@@ -128,7 +128,7 @@ class TestFetchLongShortRatio:
 
     def test_empty_response(self, fetcher):
         """空响应返回空 DataFrame 且列正确"""
-        fetcher.exchange.fapi_public_get_toplongshortpositionratio.return_value = []
+        fetcher.exchange.fapiDataGetTopLongShortPositionRatio.return_value = []
 
         df = fetcher.fetch_long_short_ratio("ETH/USDT")
 
@@ -139,7 +139,7 @@ class TestFetchLongShortRatio:
 class TestFetchTakerBuySellVolume:
     def test_returns_dataframe_with_symbol(self, fetcher):
         """返回 DataFrame 应包含 symbol 列"""
-        fetcher.exchange.fapi_public_get_takerlongshort_ratio.return_value = [
+        fetcher.exchange.fapiDataGetTakerlongshortRatio.return_value = [
             {
                 "timestamp": "1705305600000",
                 "buyVol": "100.5",
@@ -158,7 +158,7 @@ class TestFetchTakerBuySellVolume:
 
     def test_empty_response(self, fetcher):
         """空响应返回空 DataFrame 且列正确"""
-        fetcher.exchange.fapi_public_get_takerlongshort_ratio.return_value = []
+        fetcher.exchange.fapiDataGetTakerlongshortRatio.return_value = []
 
         df = fetcher.fetch_taker_buy_sell_volume("SOL/USDT")
 
@@ -167,7 +167,7 @@ class TestFetchTakerBuySellVolume:
 
     def test_missing_fields_default_to_zero(self, fetcher):
         """字段缺失时应使用默认值 0"""
-        fetcher.exchange.fapi_public_get_takerlongshort_ratio.return_value = [
+        fetcher.exchange.fapiDataGetTakerlongshortRatio.return_value = [
             {"timestamp": "1705305600000"},  # 缺少 buyVol, sellVol, buySellRatio
         ]
 

@@ -299,7 +299,7 @@ def retry_on_failure(max_retries=None):   # 第1层: 装饰器工厂（接受参
 
 **核心知识点：**
 - **ccxt 合约模式**：`options["defaultType"] = "future"` 切换到合约 API
-- **ccxt 未封装的接口**：通过 `exchange.fapi_public_get_*` 直接调用 Binance 私有 API
+- **ccxt 隐式 API 方法**：通过 `exchange.fapiPublicGet*` / `exchange.fapiDataGet*` 调用 Binance 未封装的私有 API（ccxt v4 仅保留 camelCase 命名，且数据分析接口归入 `fapiData` 分区）
 - **符号转换**：`"BTC/USDT"` → `"BTC/USDT:USDT"`（ccxt 合约格式）→ `"BTCUSDT"`（Binance API 格式）
 
 **阅读重点：**
@@ -309,7 +309,9 @@ def retry_on_failure(max_retries=None):   # 第1层: 装饰器工厂（接受参
 | 37-64 | 两个辅助函数：现货→合约符号, 现货→Binance原生符号 |
 | 88-96 | 交易所实例配置：`"defaultType": "future"` 的作用 |
 | 109-148 | `fetch_funding_rate`：ccxt 封装好的接口 `fetch_funding_rate_history` |
-| 151-192 | `fetch_open_interest`：ccxt 未封装的接口 `fapi_public_get_open_interest` |
+| 152-194 | `fetch_open_interest`：ccxt v4 隐式方法 `fapiPublicGetOpenInterest`（fapiPublic 分区） |
+| 197-241 | `fetch_long_short_ratio`：ccxt v4 隐式方法 `fapiDataGetTopLongShortPositionRatio`（fapiData 分区） |
+| 243-289 | `fetch_taker_buy_sell_volume`：ccxt v4 隐式方法 `fapiDataGetTakerlongshortRatio`（fapiData 分区） |
 
 ---
 

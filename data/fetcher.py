@@ -63,6 +63,9 @@ class KlineFetcher:
             "secret": settings.API_SECRET,
             "timeout": settings.REQUEST_TIMEOUT * 1000,  # ccxt 用毫秒
             "enableRateLimit": True,  # ccxt 内置的请求频率限制
+            "options": {
+                "fetchCurrencies": False,  # 禁用 SAPI 货币请求，避免不可达端点
+            },
         }
 
         # 配置代理（本地开发环境可能需要）

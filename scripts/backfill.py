@@ -175,8 +175,10 @@ def main():
             tzinfo=timezone.utc
         )
     if args.end:
+        # 将 --end 日期解析为当天结束（23:59:59 UTC），符合用户直觉
+        # 用户输入 --end 2024-12-01 意为"回填到 12 月 1 日结束"
         end = datetime.strptime(args.end, "%Y-%m-%d").replace(
-            tzinfo=timezone.utc
+            hour=23, minute=59, second=59, tzinfo=timezone.utc
         )
     else:
         end = datetime.now(timezone.utc)

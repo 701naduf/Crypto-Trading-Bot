@@ -62,14 +62,15 @@ class TickFetcher:
             "secret": settings.API_SECRET,
             "timeout": settings.REQUEST_TIMEOUT * 1000,
             "enableRateLimit": True,
+            "options": {
+                "fetchCurrencies": False,  # 禁用 SAPI 货币请求，避免不可达端点
+            },
         }
 
+        # ccxt 异步版基于 aiohttp，代理配置使用 aiohttp_proxy 字段
         if settings.PROXY_HOST and settings.PROXY_PORT:
             proxy_url = f"http://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
-            config["proxies"] = {
-                "http": proxy_url,
-                "https": proxy_url,
-            }
+            config["aiohttp_proxy"] = proxy_url
 
         self.exchange = exchange_class(config)
         logger.info(f"Tick 拉取器已初始化 (异步): {exchange_id}")
