@@ -1,0 +1,7 @@
+ccxt>=4.0.0              # 交易所统一接口（REST + WebSocket）
+pandas>=2.0.0            # 数据处理
+pyarrow>=14.0.0          # Parquet 读写
+python-dotenv>=1.0.0     # .env 环境变量加载
+websockets>=12.0         # WebSocket 连接
+aiohttp>=3.9.0           # 异步 HTTP（ccxt 异步模式依赖）
+pytest>=7.0.0            # 测试框架
