@@ -11,7 +11,7 @@
 
 import sys
 
-from config import settings
+from data_infra.config import settings
 
 
 def print_usage():
@@ -25,30 +25,30 @@ def print_usage():
     print(f"交易所: {settings.EXCHANGE_ID}")
 
     print("\n--- 数据采集 ---")
-    print("  K线采集:     python -m scripts.collect_klines")
-    print("  逐笔成交:   python -m scripts.collect_ticks")
-    print("  订单簿:     python -m scripts.collect_orderbook")
-    print("  合约数据:   python -m scripts.collect_market")
+    print("  K线采集:     python -m data_infra.scripts.collect_klines")
+    print("  逐笔成交:   python -m data_infra.scripts.collect_ticks")
+    print("  订单簿:     python -m data_infra.scripts.collect_orderbook")
+    print("  合约数据:   python -m data_infra.scripts.collect_market")
 
     print("\n--- 工具 ---")
-    print("  运行状态:   python -m scripts.status")
-    print("  数据巡检:   python -m scripts.check_data")
-    print("  数据巡检+修复: python -m scripts.check_data --fix")
+    print("  运行状态:   python -m data_infra.scripts.status")
+    print("  数据巡检:   python -m data_infra.scripts.check_data")
+    print("  数据巡检+修复: python -m data_infra.scripts.check_data --fix")
 
     print("\n--- 历史回填 ---")
-    print("  K线回填:    python -m scripts.backfill --type kline --start 2024-01-01")
-    print("  Tick回填:   python -m scripts.backfill --type tick --start 2024-06-01")
-    print("  资金费率:   python -m scripts.backfill --type funding_rate --start 2024-01-01")
+    print("  K线回填:    python -m data_infra.scripts.backfill --type kline --start 2024-01-01")
+    print("  Tick回填:   python -m data_infra.scripts.backfill --type tick --start 2024-06-01")
+    print("  资金费率:   python -m data_infra.scripts.backfill --type funding_rate --start 2024-01-01")
 
     print("\n--- 测试 ---")
-    print("  运行测试:   python -m pytest tests/ -v")
+    print("  运行测试:   python -m pytest data_infra/tests/ -v")
     print()
 
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         # 委托给 status 脚本
-        from scripts.status import main as status_main
+        from data_infra.scripts.status import main as status_main
         status_main()
     else:
         print_usage()

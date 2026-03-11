@@ -29,48 +29,44 @@
 
 ```
 Crypto-Trading-Bot/
-├── data_infra/                # 数据基础设施（Phase 1）
-│   ├── config/                # 配置层（最底层，无依赖）
-│   │   ├── __init__.py
-│   │   └── settings.py        # 全局配置，所有模块的参数来源
-│   │
-│   ├── utils/                 # 工具层（依赖 config）
-│   │   ├── logger.py          # 统一日志（控制台 + 按天轮转文件）
-│   │   ├── time_utils.py      # 时间转换（ms ↔ datetime, 对齐, 周期转换）
-│   │   ├── retry.py           # 重试装饰器（同步/异步, 异常分类, 指数退避）
-│   │   └── heartbeat.py       # 运行状态监控（心跳日志 + 状态JSON文件）
-│   │
-│   ├── data/                  # 数据层核心
-│   │   ├── fetcher.py         # K线拉取（同步 REST, ccxt）
-│   │   ├── tick_fetcher.py    # 逐笔成交拉取（异步 REST, ccxt async）
-│   │   ├── orderbook_fetcher.py # 订单簿拉取（异步 WebSocket）
-│   │   ├── market_fetcher.py  # 合约市场数据拉取（同步 REST, 合约API）
-│   │   │
-│   │   ├── kline_store.py     # K线存储（SQLite + WAL）
-│   │   ├── tick_store.py      # 逐笔成交存储（Parquet 按天分区）
-│   │   ├── orderbook_store.py # 订单簿存储（Parquet + 内存缓冲刷盘）
-│   │   ├── market_store.py    # 市场数据存储（SQLite 四张表）
-│   │   │
-│   │   ├── validator.py       # 数据校验（写入校验 + 完整性巡检）
-│   │   ├── writer.py          # 统一写入入口（校验 → Store）
-│   │   ├── reader.py          # 统一读取入口（路由 → Store/聚合）
-│   │   └── aggregator.py      # 数据聚合（tick→OHLCV, 1m→5m/1h）
-│   │
-│   ├── scripts/               # 采集脚本（独立进程）
-│   │   ├── collect_klines.py  # K线持续采集
-│   │   ├── collect_ticks.py   # 逐笔成交持续采集（异步）
-│   │   ├── collect_orderbook.py # 订单簿持续采集（WebSocket）
-│   │   ├── collect_market.py  # 合约市场数据持续采集
-│   │   ├── backfill.py        # 历史数据回填
-│   │   ├── check_data.py      # 数据质量巡检 + 自动修复
-│   │   └── status.py          # 查看各采集器运行状态
-│   │
-│   └── tests/                 # 单元测试（14个文件, 125个测试用例）
+├── config/                 # 配置层（最底层，无依赖）
+│   ├── __init__.py
+│   └── settings.py         # 全局配置，所有模块的参数来源
 │
-├── db/                        # 共享数据存储（各模块通过此目录通信）
-├── logs/                      # 日志 + 状态文件
-├── main.py                    # 入口（用法说明）
-└── requirements.txt           # 依赖清单
+├── utils/                  # 工具层（依赖 config）
+│   ├── logger.py           # 统一日志（控制台 + 按天轮转文件）
+│   ├── time_utils.py       # 时间转换（ms ↔ datetime, 对齐, 周期转换）
+│   ├── retry.py            # 重试装饰器（同步/异步, 异常分类, 指数退避）
+│   └── heartbeat.py        # 运行状态监控（心跳日志 + 状态JSON文件）
+│
+├── data/                   # 数据层核心
+│   ├── fetcher.py          # K线拉取（同步 REST, ccxt）
+│   ├── tick_fetcher.py     # 逐笔成交拉取（异步 REST, ccxt async）
+│   ├── orderbook_fetcher.py# 订单簿拉取（异步 WebSocket）
+│   ├── market_fetcher.py   # 合约市场数据拉取（同步 REST, 合约API）
+│   │
+│   ├── kline_store.py      # K线存储（SQLite + WAL）
+│   ├── tick_store.py       # 逐笔成交存储（Parquet 按天分区）
+│   ├── orderbook_store.py  # 订单簿存储（Parquet + 内存缓冲刷盘）
+│   ├── market_store.py     # 市场数据存储（SQLite 四张表）
+│   │
+│   ├── validator.py        # 数据校验（写入校验 + 完整性巡检）
+│   ├── writer.py           # 统一写入入口（校验 → Store）
+│   ├── reader.py           # 统一读取入口（路由 → Store/聚合）
+│   └── aggregator.py       # 数据聚合（tick→OHLCV, 1m→5m/1h）
+│
+├── scripts/                # 采集脚本（独立进程）
+│   ├── collect_klines.py   # K线持续采集
+│   ├── collect_ticks.py    # 逐笔成交持续采集（异步）
+│   ├── collect_orderbook.py# 订单簿持续采集（WebSocket）
+│   ├── collect_market.py   # 合约市场数据持续采集
+│   ├── backfill.py         # 历史数据回填
+│   ├── check_data.py       # 数据质量巡检 + 自动修复
+│   └── status.py           # 查看各采集器运行状态
+│
+├── tests/                  # 单元测试（14个文件, 125个测试用例）
+├── main.py                 # 入口（用法说明）
+└── requirements.txt        # 依赖清单
 ```
 
 **依赖方向（只能向下依赖，不能向上）：**
@@ -85,21 +81,21 @@ tests/  →  data/  →  utils/  →  config/
 ## 二、建议学习路线
 
 ```
-第1站 data_infra/config/settings.py      ← 理解所有配置项
+第1站 config/settings.py            ← 理解所有配置项
   ↓
-第2站 data_infra/utils/ (4个文件)         ← 理解基础工具
+第2站 utils/ (4个文件)               ← 理解基础工具
   ↓
-第3站 data_infra/data/fetcher 系列 (4个文件) ← 理解数据从哪来
+第3站 data/fetcher 系列 (4个文件)    ← 理解数据从哪来
   ↓
-第4站 data_infra/data/store 系列 (4个文件)   ← 理解数据存到哪去
+第4站 data/store 系列 (4个文件)      ← 理解数据存到哪去
   ↓
-第5站 data_infra/data/writer + reader + validator ← 理解门面模式
+第5站 data/writer + reader + validator ← 理解门面模式
   ↓
-第6站 data_infra/data/aggregator.py      ← 理解数据聚合
+第6站 data/aggregator.py            ← 理解数据聚合
   ↓
-第7站 data_infra/scripts/ (7个文件)       ← 理解如何组装成完整采集流程
+第7站 scripts/ (7个文件)             ← 理解如何组装成完整采集流程
   ↓
-第8站 data_infra/tests/ (14个文件)        ← 理解如何测试、学习mock技巧
+第8站 tests/ (14个文件)              ← 理解如何测试、学习mock技巧
 ```
 
 每个站建议先看**模块顶部的文档字符串**，再看代码。
@@ -109,12 +105,12 @@ tests/  →  data/  →  utils/  →  config/
 
 ## 三、第 1 站：配置层 config/
 
-### 文件：`data_infra/config/settings.py`
+### 文件：`config/settings.py`
 
 **核心知识点：**
 - **环境变量 + .env 文件**：敏感信息（API Key）通过 `python-dotenv` 从 `.env` 文件读取，不硬编码在源码中
-- **集中配置管理**：所有可调参数在一个文件中，其他模块通过 `from data_infra.config import settings` 引用
-- **PROJECT_ROOT 的计算**：`Path(__file__).resolve().parent.parent.parent`——从 `data_infra/config/settings.py` 向上三级得到项目根目录
+- **集中配置管理**：所有可调参数在一个文件中，其他模块通过 `from config import settings` 引用
+- **PROJECT_ROOT 的计算**：`Path(__file__).resolve().parent.parent`——从 `config/settings.py` 向上两级得到项目根目录
 
 **阅读重点：**
 
@@ -136,7 +132,7 @@ tests/  →  data/  →  utils/  →  config/
 
 ## 四、第 2 站：工具层 utils/
 
-### 4.1 `data_infra/utils/logger.py` — 统一日志
+### 4.1 `utils/logger.py` — 统一日志
 
 **核心知识点：**
 - **logging 模块三要素**：Logger, Handler, Formatter
@@ -151,7 +147,7 @@ tests/  →  data/  →  utils/  →  config/
 | 62-65 | Formatter 的格式字符串设计 |
 | 80-89 | `TimedRotatingFileHandler` 按天轮转日志 |
 
-### 4.2 `data_infra/utils/time_utils.py` — 时间处理
+### 4.2 `utils/time_utils.py` — 时间处理
 
 **核心知识点：**
 - **毫秒时间戳 ↔ datetime** 的互转（交易所 API 用毫秒，Python 用 datetime）
@@ -168,7 +164,7 @@ tests/  →  data/  →  utils/  →  config/
 
 **动手练习：**
 ```python
-from data_infra.utils.time_utils import *
+from utils.time_utils import *
 from datetime import datetime, timezone
 
 # 试试这些转换
@@ -180,7 +176,7 @@ print(align_to_timeframe(dt, "1h"))    # → 10:00:00
 print(timeframe_to_seconds("4h"))      # → 14400
 ```
 
-### 4.3 `data_infra/utils/retry.py` — 重试与容错
+### 4.3 `utils/retry.py` — 重试与容错
 
 **核心知识点：**
 - **装饰器模式**：`@retry_on_failure()` 给函数自动加上重试逻辑
@@ -208,7 +204,7 @@ def retry_on_failure(max_retries=None):   # 第1层: 装饰器工厂（接受参
     return decorator
 ```
 
-### 4.4 `data_infra/utils/heartbeat.py` — 运行状态监控
+### 4.4 `utils/heartbeat.py` — 运行状态监控
 
 **核心知识点：**
 - **长期运行进程的可观测性**：定期输出心跳日志 + 写入状态 JSON 文件
@@ -230,7 +226,7 @@ def retry_on_failure(max_retries=None):   # 第1层: 装饰器工厂（接受参
 
 四个 Fetcher 代表了三种不同的数据获取模式，是学习 API 交互的好材料。
 
-### 5.1 `data_infra/data/fetcher.py` — K线拉取（同步 REST）
+### 5.1 `data/fetcher.py` — K线拉取（同步 REST）
 
 **核心知识点：**
 - **ccxt 统一接口**：`exchange.fetch_ohlcv(symbol, timeframe, since, limit)` 对接任意交易所
@@ -246,7 +242,7 @@ def retry_on_failure(max_retries=None):   # 第1层: 装饰器工厂（接受参
 | 80-134 | `fetch_ohlcv`：ccxt 返回的原始格式（嵌套列表）→ DataFrame 的转换 |
 | 136-215 | `fetch_ohlcv_batch`：**分页循环的标准范式**——since 递推 + 不满额退出 + 去重合并 |
 
-### 5.2 `data_infra/data/tick_fetcher.py` — 逐笔成交拉取（异步 REST）
+### 5.2 `data/tick_fetcher.py` — 逐笔成交拉取（异步 REST）
 
 **核心知识点：**
 - **async/await 基础**：异步函数的定义与调用
@@ -269,7 +265,7 @@ def retry_on_failure(max_retries=None):   # 第1层: 装饰器工厂（接受参
 - `ccxt.binance` vs `ccxt_async.binance`
 - 同步版无需 `close()`，异步版必须
 
-### 5.3 `data_infra/data/orderbook_fetcher.py` — 订单簿拉取（异步 WebSocket）
+### 5.3 `data/orderbook_fetcher.py` — 订单簿拉取（异步 WebSocket）
 
 **核心知识点：**
 - **WebSocket vs REST**：REST 是主动请求/被动响应，WebSocket 是建立连接后被动接收推送
@@ -299,7 +295,7 @@ def retry_on_failure(max_retries=None):   # 第1层: 装饰器工厂（接受参
 | 频率 | 60s/轮 | 满额立即继续 | 100ms |
 | 历史回填 | 支持 | 支持 | 不支持 |
 
-### 5.4 `data_infra/data/market_fetcher.py` — 合约市场数据拉取
+### 5.4 `data/market_fetcher.py` — 合约市场数据拉取
 
 **核心知识点：**
 - **ccxt 合约模式**：`options["defaultType"] = "future"` 切换到合约 API
@@ -323,7 +319,7 @@ def retry_on_failure(max_retries=None):   # 第1层: 装饰器工厂（接受参
 
 四个 Store 覆盖了两种存储引擎（SQLite + Parquet），以及不同的写入策略。
 
-### 6.1 `data_infra/data/kline_store.py` — K线 SQLite 存储
+### 6.1 `data/kline_store.py` — K线 SQLite 存储
 
 **核心知识点：**
 - **SQLite WAL 模式**：`PRAGMA journal_mode=WAL`——允许读写并发（采集写入不阻塞查询读取）
@@ -341,7 +337,7 @@ def retry_on_failure(max_retries=None):   # 第1层: 装饰器工厂（接受参
 
 **动手练习：**
 ```python
-from data_infra.data.kline_store import KlineStore
+from data.kline_store import KlineStore
 import pandas as pd, tempfile, os
 
 # 用临时文件做实验
@@ -363,7 +359,7 @@ print(store.count("BTC/USDT", "1m"))         # → 5
 print(store.get_latest_timestamp("BTC/USDT", "1m"))
 ```
 
-### 6.2 `data_infra/data/tick_store.py` — 逐笔成交 Parquet 存储
+### 6.2 `data/tick_store.py` — 逐笔成交 Parquet 存储
 
 **核心知识点：**
 - **Parquet 格式**：列式存储，适合分析型读取，Snappy 压缩
@@ -392,7 +388,7 @@ print(store.get_latest_timestamp("BTC/USDT", "1m"))
 | 并发 | WAL 模式 | 文件级隔离 |
 | 适用场景 | 结构化查询、小数据 | 大批量分析、列式读取 |
 
-### 6.3 `data_infra/data/orderbook_store.py` — 订单簿存储（带内存缓冲）
+### 6.3 `data/orderbook_store.py` — 订单簿存储（带内存缓冲）
 
 **核心知识点：**
 - **内存缓冲 + 批量刷盘**：每条数据先进内存缓冲，满 10000 条后一次性写入磁盘（减少 I/O）
@@ -409,7 +405,7 @@ print(store.get_latest_timestamp("BTC/USDT", "1m"))
 | 137-181 | `append`：嵌套→扁平转换 + 缓冲满时自动触发 flush |
 | 238-307 | `read`：按需加载档位（`levels` 参数）减少内存占用 |
 
-### 6.4 `data_infra/data/market_store.py` — 市场数据 SQLite 存储
+### 6.4 `data/market_store.py` — 市场数据 SQLite 存储
 
 **核心知识点：**
 - **四表共用一个数据库**：`market.db` 中四张表分别存储不同类型的市场数据
@@ -430,7 +426,7 @@ print(store.get_latest_timestamp("BTC/USDT", "1m"))
 
 这三个模块是数据层的**门面（Facade）**，将底层复杂性封装起来。
 
-### 7.1 `data_infra/data/writer.py` — 统一写入入口
+### 7.1 `data/writer.py` — 统一写入入口
 
 **核心知识点：**
 - **门面模式**：采集脚本不直接操作 Store，而是通过 DataWriter 间接写入
@@ -446,7 +442,7 @@ print(store.get_latest_timestamp("BTC/USDT", "1m"))
 | 111-137 | 订单簿写入的特殊性：append + flush 两步分离 |
 | 188-203 | 断点续传查询接口 |
 
-### 7.2 `data_infra/data/reader.py` — 统一读取入口
+### 7.2 `data/reader.py` — 统一读取入口
 
 **核心知识点：**
 - **路由模式**：`get_ohlcv("BTC/USDT", "5m")` 自动路由到 SQLite 读 1m + 降采样
@@ -460,7 +456,7 @@ print(store.get_latest_timestamp("BTC/USDT", "1m"))
 | 61-97 | `get_ohlcv`：**三路分发**的路由逻辑 |
 | 99-154 | `_ohlcv_from_ticks`：按天分片聚合的实现——内存友好 |
 
-### 7.3 `data_infra/data/validator.py` — 数据校验
+### 7.3 `data/validator.py` — 数据校验
 
 **核心知识点：**
 - **校验哲学**：宁可漏放，不可误杀——只过滤明显不合理的数据
@@ -479,7 +475,7 @@ print(store.get_latest_timestamp("BTC/USDT", "1m"))
 
 ## 八、第 6 站：数据处理层 Aggregator
 
-### `data_infra/data/aggregator.py`
+### `data/aggregator.py`
 
 **核心知识点：**
 - **tick → OHLCV**：按时间窗口分组聚合（resample）
@@ -547,7 +543,7 @@ def main():
 
 ### 9.2 各脚本的差异
 
-**`data_infra/scripts/collect_klines.py`**（最简单，建议第一个读）
+**`collect_klines.py`**（最简单，建议第一个读）
 
 | 行 | 学什么 |
 |----|--------|
@@ -555,7 +551,7 @@ def main():
 | 82-90 | 断点续传：查询最新 K线 时间 → 计算下一个 since |
 | 117-120 | **可中断的 sleep**：`for _ in range(60): sleep(1)` 而不是 `sleep(60)` |
 
-**`data_infra/scripts/collect_ticks.py`**（异步版）
+**`collect_ticks.py`**（异步版）
 
 | 行 | 学什么 |
 |----|--------|
@@ -563,14 +559,14 @@ def main():
 | 63 | `heartbeat.set_status("catching_up")`：区分追赶中 vs 空闲状态 |
 | 74-78 | 冷启动处理：首次采集时调用 `resolve_cold_start` |
 
-**`data_infra/scripts/collect_orderbook.py`**（回调模式）
+**`collect_orderbook.py`**（回调模式）
 
 | 行 | 学什么 |
 |----|--------|
 | 56-70 | `on_snapshot` 回调：WebSocket 每收到一个推送就触发 |
 | 73-79 | 退出刷盘：`shutdown_handler` 中先 flush 再退出 |
 
-**`data_infra/scripts/collect_market.py`**（多指标采集）
+**`collect_market.py`**（多指标采集）
 
 | 行 | 学什么 |
 |----|--------|
@@ -578,14 +574,14 @@ def main():
 
 ### 9.3 工具脚本
 
-**`data_infra/scripts/backfill.py`** — 历史数据回填
+**`backfill.py`** — 历史数据回填
 
 | 行 | 学什么 |
 |----|--------|
 | 69-81 | K线批量回填：`fetch_ohlcv_batch` 自动分页 |
 | 114-139 | Tick 逐批回填：直接调用 `fetch_trades`（单批）→ 立即写入 → 更新 current_id |
 
-**`data_infra/scripts/check_data.py`** — 数据质量巡检
+**`check_data.py`** — 数据质量巡检
 
 | 行 | 学什么 |
 |----|--------|
@@ -620,10 +616,10 @@ def main():
 **技巧 1：patch + MagicMock 替换外部依赖**
 
 ```python
-# data_infra/tests/test_fetcher.py
+# tests/test_fetcher.py
 @pytest.fixture
 def fetcher():
-    with patch("data_infra.data.fetcher.ccxt") as mock_ccxt:
+    with patch("data.fetcher.ccxt") as mock_ccxt:
         mock_exchange = MagicMock()
         mock_ccxt.binance.return_value = mock_exchange
         f = KlineFetcher()
@@ -632,14 +628,14 @@ def fetcher():
 ```
 
 要点：
-- `patch("data_infra.data.fetcher.ccxt")` 替换的是 **fetcher 模块中导入的 ccxt**，不是全局的
+- `patch("data.fetcher.ccxt")` 替换的是 **fetcher 模块中导入的 ccxt**，不是全局的
 - `mock_exchange.fetch_ohlcv.return_value = [...]` 预设返回值
 - `mock_exchange.fetch_ohlcv.side_effect = [page1, page2]` 预设多次调用的不同返回
 
 **技巧 2：AsyncMock 测试异步函数**
 
 ```python
-# data_infra/tests/test_tick_fetcher.py
+# tests/test_tick_fetcher.py
 mock_exchange = MagicMock()
 mock_exchange.fetch_trades = AsyncMock()    # 异步方法用 AsyncMock
 mock_exchange.close = AsyncMock()
@@ -651,7 +647,7 @@ df = asyncio.run(fetcher.fetch_trades("BTC/USDT"))
 **技巧 3：tempfile 隔离测试数据**
 
 ```python
-# data_infra/tests/test_kline_store.py
+# tests/test_kline_store.py
 @pytest.fixture
 def store(tmp_path):
     db_path = str(tmp_path / "test_kline.db")
@@ -664,16 +660,16 @@ def store(tmp_path):
 
 ```bash
 # 运行全部测试
-python -m pytest data_infra/tests/ -v
+python -m pytest tests/ -v
 
 # 只运行某个文件
-python -m pytest data_infra/tests/test_fetcher.py -v
+python -m pytest tests/test_fetcher.py -v
 
 # 只运行某个类/方法
-python -m pytest data_infra/tests/test_fetcher.py::TestFetchOhlcv::test_returns_correct_columns -v
+python -m pytest tests/test_fetcher.py::TestFetchOhlcv::test_returns_correct_columns -v
 
 # 显示覆盖率
-python -m pytest data_infra/tests/ --cov=data_infra.data --cov=data_infra.utils --cov-report=term-missing
+python -m pytest tests/ --cov=data --cov=utils --cov-report=term-missing
 ```
 
 ---
@@ -774,25 +770,25 @@ INSERT OR IGNORE INTO klines ... VALUES ...
 完成以下练习，可以加深对代码的理解：
 
 ### 练习 1：配置变更（简单）
-在 `data_infra/config/settings.py` 中添加一个新交易对 `XRP/USDT`。思考：你需要改几个文件？
+在 `settings.py` 中添加一个新交易对 `XRP/USDT`。思考：你需要改几个文件？
 
 ### 练习 2：手动测试 Store（简单）
 在 Python REPL 中手动创建一个临时 KlineStore，写入数据，读出来验证。
 
 ### 练习 3：阅读测试理解行为（中等）
-通读 `data_infra/tests/test_tick_store.py`，仅通过测试用例的名字和断言，推断 TickStore 的行为规范。然后对照源码验证你的推断。
+通读 `test_tick_store.py`，仅通过测试用例的名字和断言，推断 TickStore 的行为规范。然后对照源码验证你的推断。
 
 ### 练习 4：追踪一次完整采集（中等）
-从 `data_infra/scripts/collect_klines.py` 的 `main()` 开始，逐行追踪一次完整的 K线 采集流程：
+从 `collect_klines.py` 的 `main()` 开始，逐行追踪一次完整的 K线 采集流程：
 `main → parse_args → KlineFetcher.fetch_ohlcv → DataWriter.write_ohlcv → validator.validate_ohlcv → KlineStore.write`
 
 画出函数调用链，标注每个环节的输入和输出类型。
 
 ### 练习 5：写一个新的校验规则（中等）
-在 `data_infra/data/validator.py` 中为 `validate_ohlcv` 添加一条新规则：volume 不应超过 close × 1,000,000（防止异常大量）。然后在 `data_infra/tests/test_validator.py` 中添加对应的测试。
+在 `validator.py` 中为 `validate_ohlcv` 添加一条新规则：volume 不应超过 close × 1,000,000（防止异常大量）。然后在 `test_validator.py` 中添加对应的测试。
 
 ### 练习 6：理解 mock 模式（进阶）
-阅读 `data_infra/tests/test_tick_fetcher.py`，回答：
+阅读 `test_tick_fetcher.py`，回答：
 - 为什么 `fetcher.exchange.fetch_trades` 要用 `AsyncMock` 而不是 `MagicMock`？
 - `side_effect = [batch1, batch2]` 是什么意思？
 - 测试中的 `asyncio.run()` 起什么作用？

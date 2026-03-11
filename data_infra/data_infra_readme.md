@@ -1,51 +1,45 @@
-# Crypto Trading Bot — 量化加密货币交易框架
+# Crypto Trading Bot — 第一阶段：数据基础设施
 
-量化加密货币交易机器人，聚焦 Binance 交易所。模块化架构，各阶段独立开发。
+量化加密货币交易机器人，聚焦 Binance 交易所。本阶段构建完整的数据采集、存储、读取管道。
 
 ## 项目结构
 
 ```
 Crypto-Trading-Bot/
-├── data_infra/                 # 第一阶段：数据基础设施
-│   ├── config/
-│   │   ├── __init__.py
-│   │   └── settings.py         #   全局配置（交易所、币对、路径、容错等）
-│   ├── utils/
-│   │   ├── logger.py           #   统一日志（控制台 + 文件，按日轮转）
-│   │   ├── time_utils.py       #   时间工具（ms ↔ datetime, 时间对齐）
-│   │   ├── retry.py            #   重试装饰器（异常分类 + 指数退避）
-│   │   └── heartbeat.py        #   运行状态监控（心跳日志 + 状态文件）
-│   ├── data/
-│   │   ├── fetcher.py          #   K线拉取（同步 REST）
-│   │   ├── tick_fetcher.py     #   逐笔成交拉取（异步, trade_id 追赶）
-│   │   ├── orderbook_fetcher.py#   订单簿采集（异步 WebSocket）
-│   │   ├── market_fetcher.py   #   合约市场数据拉取（同步 REST）
-│   │   ├── kline_store.py      #   SQLite K线存储（WAL 模式）
-│   │   ├── tick_store.py       #   Parquet 逐笔成交存储（按天分区, 原子写入）
-│   │   ├── orderbook_store.py  #   Parquet 订单簿存储（缓冲 + 刷盘）
-│   │   ├── market_store.py     #   SQLite 合约市场数据存储
-│   │   ├── aggregator.py       #   数据聚合（tick→OHLCV, K线降采样）
-│   │   ├── validator.py        #   数据质量校验
-│   │   ├── writer.py           #   统一写入入口（校验→存储）
-│   │   └── reader.py           #   统一读取入口（自动路由 + 聚合）
-│   ├── scripts/
-│   │   ├── collect_klines.py   #   K线采集（独立进程, 7×24）
-│   │   ├── collect_ticks.py    #   逐笔成交采集（独立进程, 7×24）
-│   │   ├── collect_orderbook.py#   订单簿采集（独立进程, WebSocket, 7×24）
-│   │   ├── collect_market.py   #   合约市场数据采集（独立进程, 7×24）
-│   │   ├── backfill.py         #   历史数据回填
-│   │   ├── check_data.py       #   数据质量巡检
-│   │   └── status.py           #   查看所有采集脚本运行状态
-│   └── tests/                  #   单元测试（125 项）
-│
-├── db/                         # 共享数据存储（各模块通过此目录通信）
-├── logs/                       # 日志 + 状态文件
-├── docs/                       # 设计文档
-├── study/                      # 学习笔记
-├── notebooks/                  # Jupyter 研究笔记
-├── main.py                     # 主入口
+├── config/
+│   ├── __init__.py
+│   └── settings.py              # 全局配置（交易所、币对、路径、容错等）
+├── utils/
+│   ├── logger.py                # 统一日志（控制台 + 文件，按日轮转）
+│   ├── time_utils.py            # 时间工具（ms ↔ datetime, 时间对齐）
+│   ├── retry.py                 # 重试装饰器（异常分类 + 指数退避）
+│   └── heartbeat.py             # 运行状态监控（心跳日志 + 状态文件）
+├── data/
+│   ├── fetcher.py               # K线拉取（同步 REST）
+│   ├── tick_fetcher.py          # 逐笔成交拉取（异步, trade_id 追赶）
+│   ├── orderbook_fetcher.py     # 订单簿采集（异步 WebSocket）
+│   ├── market_fetcher.py        # 合约市场数据拉取（同步 REST）
+│   ├── kline_store.py           # SQLite K线存储（WAL 模式）
+│   ├── tick_store.py            # Parquet 逐笔成交存储（按天分区, 原子写入）
+│   ├── orderbook_store.py       # Parquet 订单簿存储（缓冲 + 刷盘）
+│   ├── market_store.py          # SQLite 合约市场数据存储
+│   ├── aggregator.py            # 数据聚合（tick→OHLCV, K线降采样）
+│   ├── validator.py             # 数据质量校验
+│   ├── writer.py                # 统一写入入口（校验→存储）
+│   └── reader.py                # 统一读取入口（自动路由 + 聚合）
+├── scripts/
+│   ├── collect_klines.py        # K线采集（独立进程, 7×24）
+│   ├── collect_ticks.py         # 逐笔成交采集（独立进程, 7×24）
+│   ├── collect_orderbook.py     # 订单簿采集（独立进程, WebSocket, 7×24）
+│   ├── collect_market.py        # 合约市场数据采集（独立进程, 7×24）
+│   ├── backfill.py              # 历史数据回填
+│   ├── check_data.py            # 数据质量巡检
+│   └── status.py                # 查看所有采集脚本运行状态
+├── tests/                       # 单元测试（125 项）
+├── db/                          # 数据存储（.gitignore）
+├── logs/                        # 日志 + 状态文件（.gitignore）
 ├── requirements.txt
-└── .env                        # API 密钥（.gitignore）
+└── .env                         # API 密钥（.gitignore）
 ```
 
 ## 采集的数据类型
@@ -84,7 +78,7 @@ PROXY_PORT=7890
 ### 3. 运行测试
 
 ```bash
-python -m pytest data_infra/tests/ -v
+python -m pytest tests/ -v
 ```
 
 ### 4. 启动采集
@@ -93,28 +87,28 @@ python -m pytest data_infra/tests/ -v
 
 ```bash
 # K线采集（每60秒轮询一次）
-python -m data_infra.scripts.collect_klines
+python -m scripts.collect_klines
 
 # 逐笔成交采集（持续追赶模式）
-python -m data_infra.scripts.collect_ticks
+python -m scripts.collect_ticks
 
 # 订单簿采集（WebSocket 100ms推送）
-python -m data_infra.scripts.collect_orderbook
+python -m scripts.collect_orderbook
 
 # 合约市场数据采集（每5分钟轮询）
-python -m data_infra.scripts.collect_market
+python -m scripts.collect_market
 ```
 
 ### 5. 查看采集状态
 
 ```bash
-python -m data_infra.scripts.status
+python -m scripts.status
 ```
 
 ### 6. 数据质量巡检
 
 ```bash
-python -m data_infra.scripts.check_data
+python -m scripts.check_data
 ```
 
 ---
@@ -124,7 +118,7 @@ python -m data_infra.scripts.check_data
 ### 运行全部测试
 
 ```bash
-python -m pytest data_infra/tests/ -v
+python -m pytest tests/ -v
 ```
 
 预期结果：125 项全部通过。
@@ -135,31 +129,31 @@ python -m pytest data_infra/tests/ -v
 
 ```bash
 # 配置模块
-python -m pytest data_infra/tests/test_config.py -v
+python -m pytest tests/test_config.py -v
 
 # 时间工具
-python -m pytest data_infra/tests/test_time_utils.py -v
+python -m pytest tests/test_time_utils.py -v
 
 # 数据校验
-python -m pytest data_infra/tests/test_validator.py -v
+python -m pytest tests/test_validator.py -v
 
 # K线存储（使用临时数据库）
-python -m pytest data_infra/tests/test_kline_store.py -v
+python -m pytest tests/test_kline_store.py -v
 
 # Tick存储（使用临时目录）
-python -m pytest data_infra/tests/test_tick_store.py -v
+python -m pytest tests/test_tick_store.py -v
 
 # 订单簿存储
-python -m pytest data_infra/tests/test_orderbook_store.py -v
+python -m pytest tests/test_orderbook_store.py -v
 
 # 合约市场数据存储
-python -m pytest data_infra/tests/test_market_store.py -v
+python -m pytest tests/test_market_store.py -v
 
 # 数据聚合
-python -m pytest data_infra/tests/test_aggregator.py -v
+python -m pytest tests/test_aggregator.py -v
 
 # DataReader路由
-python -m pytest data_infra/tests/test_reader.py -v
+python -m pytest tests/test_reader.py -v
 ```
 
 #### 在线功能测试（需要网络+API密钥，手动运行）
@@ -169,7 +163,7 @@ python -m pytest data_infra/tests/test_reader.py -v
 **测试 1: K线拉取**
 ```bash
 python -c "
-from data_infra.data.fetcher import KlineFetcher
+from data.fetcher import KlineFetcher
 f = KlineFetcher()
 df = f.fetch_ohlcv('BTC/USDT', '1m', limit=5)
 print(df)
@@ -180,9 +174,9 @@ print(f'拉取 {len(df)} 根K线')
 **测试 2: K线写入+读取完整流程**
 ```bash
 python -c "
-from data_infra.data.fetcher import KlineFetcher
-from data_infra.data.writer import DataWriter
-from data_infra.data.reader import DataReader
+from data.fetcher import KlineFetcher
+from data.writer import DataWriter
+from data.reader import DataReader
 
 fetcher = KlineFetcher()
 writer = DataWriter()
@@ -209,14 +203,14 @@ print(df_5m.tail())
 
 **测试 3: K线单轮采集**
 ```bash
-python -m data_infra.scripts.collect_klines --once --symbols BTC/USDT
+python -m scripts.collect_klines --once --symbols BTC/USDT
 ```
 
 **测试 4: Tick 拉取**
 ```bash
 python -c "
 import asyncio
-from data_infra.data.tick_fetcher import TickFetcher
+from data.tick_fetcher import TickFetcher
 
 async def test():
     f = TickFetcher()
@@ -234,7 +228,7 @@ asyncio.run(test())
 **测试 5: 合约市场数据**
 ```bash
 python -c "
-from data_infra.data.market_fetcher import MarketFetcher
+from data.market_fetcher import MarketFetcher
 f = MarketFetcher()
 
 # 资金费率
@@ -261,22 +255,22 @@ print(tbs)
 
 **测试 6: 合约市场数据单轮采集**
 ```bash
-python -m data_infra.scripts.collect_market --once --symbols BTC/USDT
+python -m scripts.collect_market --once --symbols BTC/USDT
 ```
 
 **测试 7: 心跳与状态**
 ```bash
 # 启动K线采集（后台）
-python -m data_infra.scripts.collect_klines &
+python -m scripts.collect_klines &
 
 # 等待一段时间后查看状态
-python -m data_infra.scripts.status
+python -m scripts.status
 ```
 
 **测试 8: 历史回填**
 ```bash
 # 回填 1 天的 K线历史
-python -m data_infra.scripts.backfill --type kline --start 2024-12-01 --end 2024-12-01 --symbols BTC/USDT
+python -m scripts.backfill --type kline --start 2024-12-01 --end 2024-12-01 --symbols BTC/USDT
 ```
 
 ### 测试覆盖范围
@@ -306,7 +300,7 @@ python -m data_infra.scripts.backfill --type kline --start 2024-12-01 --end 2024
 
 ## 交易对
 
-当前配置 5 个币对（可在 `data_infra/config/settings.py` 中修改）：
+当前配置 5 个币对（可在 `config/settings.py` 中修改）：
 
 - BTC/USDT
 - DOGE/USDT
