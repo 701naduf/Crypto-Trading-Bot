@@ -203,7 +203,9 @@ class OrderbookStore:
 
             # 转为 DataFrame
             df = pd.DataFrame(buffer)
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            # floor("ms") 将纳秒/微秒截断到毫秒，匹配 Parquet schema (pa.timestamp("ms"))
+            # datetime.now() 带微秒精度，不截断会触发 ArrowInvalid（有损转换）
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.floor("ms")
 
             # 按日期分组刷盘
             df["_date"] = df["timestamp"].dt.strftime("%Y-%m-%d")
