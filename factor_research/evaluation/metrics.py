@@ -336,22 +336,44 @@ def sharpe_ratio(
     """
     ann_ret = annualize_return(returns, periods_per_year)
     ann_vol = annualize_volatility(returns, periods_per_year)
-    if ann_vol == 0 or np.isnan(ann_vol):
-        return 0.0
-    return (ann_ret - risk_free_rate) / ann_vol
+    if np.isnan(ann_vol):
+        return np.nan
+    excess = ann_ret - risk_free_rate
+    # 波动率极小（浮点噪声级别）时视为零波动率
+    # 阈值 1e-12 远小于任何有意义的年化波动率（最小也在 0.01 量级）
+    if ann_vol < 1e-12:
+        if np.isinf(excess) and excess > 0:
+            return np.inf
+        elif np.isinf(excess) and excess < 0:
+            return -np.inf
+        elif excess > 1e-12:
+            return np.inf
+        elif excess < -1e-12:
+            return -np.inf
+        else:
+            return np.nan
+    return excess / ann_vol
 
 
 def max_drawdown(cumulative: pd.Series) -> float:
     """
     最大回撤
 
+    基于净值（wealth = 1 + cumulative_return）计算。
+    返回负数，符合行业惯例: MDD = -0.15 表示从峰值回撤 15%。
+
+    公式:
+        drawdown_t = (wealth_t - running_max_t) / running_max_t
+        MDD = min(drawdown_t)  （负数或零）
+
     Args:
         cumulative: 累计收益曲线（从 0 开始，即 cumulative_returns 的输出）
 
     Returns:
-        float: 最大回撤（正数，如 0.15 表示 15% 回撤）
+        float: 最大回撤（非正数）。
+               -0.15 表示 15% 回撤，0.0 表示无回撤。
     """
     wealth = 1 + cumulative
     running_max = wealth.cummax()
-    drawdown = (running_max - wealth) / running_max
-    return float(drawdown.max())
+    drawdown = (wealth - running_max) / running_max  # 非正数序列
+    return float(drawdown.min())

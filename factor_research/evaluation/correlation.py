@@ -151,10 +151,18 @@ def _compute_vif(factor_df: pd.DataFrame) -> dict:
         5 ≤ VIF < 10: 有共线性嫌疑
         VIF ≥ 10: 严重共线性
 
+    数值稳定性保障:
+        - 回归前检查设计矩阵的条件数，过大时发出警告
+        - 使用 lstsq（SVD 分解）而非直接矩阵求逆
+        - 对 R² 做 clip 处理，防止数值误差导致的 >1 情况
+
     Returns:
         dict: {因子名: VIF 值}
     """
     from numpy.linalg import LinAlgError
+
+    from data_infra.utils.logger import get_logger
+    logger = get_logger(__name__)
 
     vif = {}
     columns = factor_df.columns.tolist()
@@ -170,15 +178,33 @@ def _compute_vif(factor_df: pd.DataFrame) -> dict:
         try:
             # 添加截距
             X_with_const = np.column_stack([np.ones(len(X)), X])
-            # OLS: beta = (X'X)^-1 X'y
+
+            # 条件数检查: 过大说明设计矩阵近奇异
+            cond = np.linalg.cond(X_with_const)
+            if cond > 1e12:
+                logger.warning(
+                    f"VIF 计算: 因子 '{col}' 的设计矩阵条件数 = {cond:.2e}，"
+                    f"结果可能不稳定"
+                )
+
+            # OLS (SVD 分解，数值稳定)
             beta = np.linalg.lstsq(X_with_const, y, rcond=None)[0]
             y_pred = X_with_const @ beta
             ss_res = np.sum((y - y_pred) ** 2)
             ss_tot = np.sum((y - y.mean()) ** 2)
-            r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0
 
-            vif[col] = 1 / (1 - r_squared) if r_squared < 1 else float("inf")
-        except (LinAlgError, ValueError):
+            if ss_tot == 0:
+                # 因子为常数，无方差 → VIF 无定义
+                vif[col] = np.nan
+                continue
+
+            r_squared = 1 - ss_res / ss_tot
+            # clip 防止数值误差导致 R² 略超 1 或略小于 0
+            r_squared = np.clip(r_squared, 0.0, 1.0)
+
+            vif[col] = 1 / (1 - r_squared) if r_squared < 1.0 else float("inf")
+        except (LinAlgError, ValueError) as e:
+            logger.warning(f"VIF 计算失败: 因子 '{col}', 原因: {e}")
             vif[col] = np.nan
 
     return vif

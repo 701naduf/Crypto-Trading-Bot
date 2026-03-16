@@ -25,11 +25,15 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from data_infra.utils.logger import get_logger
+
 from ..config import DEFAULT_HORIZONS, MIN_IC_OBSERVATIONS
 from .metrics import (
     compute_forward_returns_panel,
     spearman_ic,
 )
+
+logger = get_logger(__name__)
 
 
 def ic_series(
@@ -60,8 +64,20 @@ def ic_series(
 
     n_cols = len(common_cols)
 
+    # 诊断日志: 数据对齐情况
+    f_nan_ratio = f.isna().sum().sum() / max(f.size, 1)
+    r_nan_ratio = r.isna().sum().sum() / max(r.size, 1)
+    logger.debug(
+        f"IC(h={horizon}): {len(common_idx)} 期 × {n_cols} 标的 | "
+        f"因子 NaN 比例={f_nan_ratio:.2%}, 收益 NaN 比例={r_nan_ratio:.2%}"
+    )
+
     if n_cols < MIN_IC_OBSERVATIONS:
         # 标的数不足，所有 IC 为 NaN
+        logger.warning(
+            f"IC(h={horizon}): 有效标的数 {n_cols} < 最小要求 {MIN_IC_OBSERVATIONS}，"
+            f"返回全 NaN"
+        )
         return pd.Series(np.nan, index=common_idx, name=f"IC_h{horizon}")
 
     # --- 向量化 Spearman: 逐行 rank → 逐行 Pearson ---
@@ -100,6 +116,15 @@ def ic_series(
     ic_values = ic_values.where(denom > 0, np.nan)
 
     ic_values.name = f"IC_h{horizon}"
+
+    # 诊断日志: IC 计算结果
+    valid_count = ic_values.notna().sum()
+    total_count = len(ic_values)
+    logger.debug(
+        f"IC(h={horizon}): 有效 IC 数 = {valid_count}/{total_count} "
+        f"({valid_count/max(total_count,1):.1%})"
+    )
+
     return ic_values
 
 

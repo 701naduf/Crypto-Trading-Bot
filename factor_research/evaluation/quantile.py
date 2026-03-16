@@ -39,6 +39,7 @@ def quantile_backtest(
     price_panel: pd.DataFrame,
     n_groups: int = DEFAULT_N_GROUPS,
     horizon: int = 1,
+    grouping: str = "equal_freq",
 ) -> dict:
     """
     分层回测（第二层 API 入口）
@@ -48,6 +49,12 @@ def quantile_backtest(
         price_panel:  价格面板（收盘价），格式同上
         n_groups:     分层组数，默认 5
         horizon:      前瞻窗口（bar 数）
+        grouping:     分组方式:
+                      - "equal_freq": 等频分组（按排名均分，每组样本量相同）
+                        适用于大多数场景，确保每组有足够样本进行统计。
+                      - "equal_width": 等距分组（按因子值区间均分）
+                        反映因子值的真实分布特征，能暴露因子值集中区域。
+                        当因子值分布严重偏斜时，某些组可能样本极少。
 
     Returns:
         dict: {
@@ -60,6 +67,10 @@ def quantile_backtest(
             "long_short_cumulative": 多空累计收益曲线 Series,
         }
     """
+    if grouping not in ("equal_freq", "equal_width"):
+        raise ValueError(
+            f"grouping 必须为 'equal_freq' 或 'equal_width'，收到 '{grouping}'"
+        )
     forward_ret = compute_forward_returns_panel(price_panel, horizon)
 
     # 对齐
@@ -86,10 +97,14 @@ def quantile_backtest(
         fv = factor_row[valid_symbols]
         rv = return_row[valid_symbols]
 
-        # 按因子值排序 → 均匀分组
-        ranked = fv.rank(method="first")
-        # 将排名映射到组号 (1 到 n_groups)
-        group_labels = pd.cut(ranked, bins=n_groups, labels=False) + 1
+        # 分组: equal_freq 按排名均分，equal_width 按因子值区间均分
+        if grouping == "equal_freq":
+            # 等频分组: 按排名均分，每组样本量相同
+            ranked = fv.rank(method="first")
+            group_labels = pd.cut(ranked, bins=n_groups, labels=False) + 1
+        else:
+            # 等距分组: 按因子值区间均分，反映真实分布
+            group_labels = pd.cut(fv, bins=n_groups, labels=False) + 1
 
         for g in range(1, n_groups + 1):
             mask = group_labels == g

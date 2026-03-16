@@ -159,16 +159,17 @@ class OrderbookStore:
                 row[f"bid_price_{i}"] = float(bids[i][0])
                 row[f"bid_qty_{i}"] = float(bids[i][1])
             else:
-                # 档位不足时填 0（不应发生，但防御性编程）
-                row[f"bid_price_{i}"] = 0.0
-                row[f"bid_qty_{i}"] = 0.0
+                # 档位不足时填 NaN，与"真实挂单量为零"区分开
+                # 下游因子计算应自行处理 NaN（如跳过、插值等）
+                row[f"bid_price_{i}"] = float("nan")
+                row[f"bid_qty_{i}"] = float("nan")
 
             if i < len(asks):
                 row[f"ask_price_{i}"] = float(asks[i][0])
                 row[f"ask_qty_{i}"] = float(asks[i][1])
             else:
-                row[f"ask_price_{i}"] = 0.0
-                row[f"ask_qty_{i}"] = 0.0
+                row[f"ask_price_{i}"] = float("nan")
+                row[f"ask_qty_{i}"] = float("nan")
 
         # 追加到缓冲
         if symbol not in self._buffers:

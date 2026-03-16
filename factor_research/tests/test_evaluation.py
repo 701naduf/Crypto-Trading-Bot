@@ -161,13 +161,31 @@ class TestMetrics:
     def test_max_drawdown(self):
         cum = pd.Series([0.0, 0.1, 0.05, 0.15, 0.08, 0.12])
         mdd = max_drawdown(cum)
-        assert mdd > 0
-        assert mdd <= 1
+        # 行业惯例: 返回负数或零
+        assert mdd <= 0
+        assert mdd >= -1
+        # 这条曲线的最大回撤发生在 0.15 → 0.08
+        # wealth: 1.15 → 1.08, drawdown = (1.08 - 1.15) / 1.15 ≈ -0.0609
+        assert mdd == pytest.approx((1.08 - 1.15) / 1.15, abs=1e-4)
 
     def test_sharpe_ratio_positive(self):
-        ret = pd.Series([0.001] * 100)  # 稳定正收益
+        ret = pd.Series([0.001] * 100)  # 稳定正收益但有微小波动
+        # 常数收益 → std=0 → 应返回 inf（正收益零波动率）
         sr = sharpe_ratio(ret)
-        assert sr > 0
+        assert sr == np.inf
+
+    def test_sharpe_ratio_zero_vol_negative(self):
+        ret = pd.Series([-0.001] * 100)  # 稳定负收益
+        sr = sharpe_ratio(ret)
+        assert sr == -np.inf
+
+    def test_sharpe_ratio_with_variance(self):
+        # 使用有波动但整体正收益的序列
+        # 小幅收益避免年化时溢出（periods_per_year=525960）
+        np.random.seed(123)
+        ret = pd.Series(np.random.randn(1000) * 0.0001 + 0.00001)
+        sr = sharpe_ratio(ret)
+        assert np.isfinite(sr)
 
 
 # =========================================================================
@@ -456,12 +474,12 @@ class TestStabilityAnalysis:
         result = stability_analysis(factor_panel, price_panel, horizon=1)
         assert isinstance(result["rolling_ic"], pd.Series)
 
-    def test_ic_max_drawdown_nonnegative(self, factor_panel, price_panel):
-        """ic_max_drawdown 为非负数"""
+    def test_ic_max_drawdown_nonpositive(self, factor_panel, price_panel):
+        """ic_max_drawdown 为非正数（行业惯例: 回撤用负数表示）"""
         result = stability_analysis(factor_panel, price_panel, horizon=1)
         mdd = result["ic_max_drawdown"]
         if not np.isnan(mdd):
-            assert mdd >= 0
+            assert mdd <= 0
 
     def test_short_data_no_crash(self):
         """短序列（< 10 行）不崩溃"""

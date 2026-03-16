@@ -1188,7 +1188,7 @@ print(loaded_meta.factor_type)  # FactorType.TIME_SERIES
 | 172-195 | `rank_normalize()` | rank(pct=True) 的含义 |
 | 197-220 | `cross_sectional_rank()` | rank(axis=1) 截面排名 |
 | 250-280 | `mutual_information()` | sklearn 互信息 + 离散化处理 |
-| 282-330 | `cumulative_returns()`, `sharpe_ratio()`, `max_drawdown()` | 组合绩效指标 |
+| 282-330 | `cumulative_returns()`, `sharpe_ratio()`, `max_drawdown()` | 组合绩效指标（注意: max_drawdown 返回负数，sharpe_ratio 零波动率返回 ±inf） |
 
 ### 动手练习
 
@@ -2860,5 +2860,1716 @@ print(f"信息保留率: {result['info_retention']:.2%}")
 3. 理解 6 个评价维度的深层含义和交叉关系
 4. 了解从因子到策略（Phase 2b）的衔接路径
 5. 具备独立完成因子全生命周期开发的能力
+
+**祝学习顺利！**
+
+---
+---
+
+# Phase 2b 模型策略 — 代码学习指引
+
+本章节对照 `alpha_model/` 源码，系统讲解从**因子面板**到**可交易目标权重**的完整流程。
+
+建议先完成 Phase 2a 的学习再进入本章。Phase 2b 的核心理念是：**框架做管道，模型做黑盒**——框架负责数据流编排（预处理 → 训练 → 信号 → 组合 → 回测），模型实现完全外接，通过 AlphaModel 协议交互。
+
+---
+
+## 目录
+
+- [一、Phase 2b 整体结构](#一phase-2b-整体结构)
+- [二、建议学习路线](#二建议学习路线-1)
+- [三、第 1 站：核心类型 core/types.py](#三第-1-站核心类型-coretypespy)
+- [四、第 2 站：预处理 preprocessing/](#四第-2-站预处理-preprocessing)
+- [五、第 3 站：训练框架 training/](#五第-3-站训练框架-training)
+- [六、第 4 站：信号生成 signal/](#六第-4-站信号生成-signal)
+- [七、第 5 站：组合构建 portfolio/](#七第-5-站组合构建-portfolio)
+- [八、第 6 站：向量化回测 backtest/](#八第-6-站向量化回测-backtest)
+- [九、第 7 站：持久化 store/](#九第-7-站持久化-store)
+- [十、第 8 站：参考模型 models/](#十第-8-站参考模型-models)
+- [十一、第 9 站：AlphaPipeline 端到端 core/pipeline.py](#十一第-9-站alphapipeline-端到端-corepipelinepy)
+- [十二、第 10 站：测试 tests/](#十二第-10-站测试-tests)
+- [十三、核心概念深入](#十三核心概念深入)
+- [十四、设计模式总结](#十四设计模式总结)
+- [十五、数据流全景图](#十五数据流全景图)
+- [十六、延伸练习](#十六延伸练习)
+
+---
+
+## 一、Phase 2b 整体结构
+
+```
+alpha_model/                     # Phase 2b 模型策略
+├── __init__.py                  # 模块文档
+├── config.py                    # 集中配置（路径、默认参数、年化常数）
+├── utils.py                     # 辅助函数（load_price_panel）
+│
+├── core/                        # 核心协议与管道
+│   ├── types.py                 # AlphaModel Protocol + 配置数据类
+│   └── pipeline.py              # AlphaPipeline: 一键管道
+│
+├── preprocessing/               # 预处理
+│   ├── alignment.py             # 多频率因子对齐
+│   ├── transform.py             # 标准化工具箱 + 特征矩阵构建
+│   └── selection.py             # 因子筛选（threshold / top_k / 族级）
+│
+├── training/                    # 训练框架
+│   ├── splitter.py              # 时序切分器（Expanding / Rolling + embargo）
+│   ├── walk_forward.py          # Walk-Forward 引擎
+│   └── trainer.py               # 训练调度器（一站式接口）
+│
+├── signal/                      # 信号生成
+│   ├── generator.py             # 预测值 → 标准化信号
+│   └── smoother.py              # EMA 信号平滑
+│
+├── portfolio/                   # 组合构建
+│   ├── beta.py                  # 滚动 beta 估计
+│   ├── covariance.py            # Ledoit-Wolf 协方差矩阵估计
+│   ├── constraints.py           # cvxpy 约束生成器
+│   ├── risk_budget.py           # 波动率目标 (Vol Targeting)
+│   └── constructor.py           # 凸优化组合构建器
+│
+├── backtest/                    # 回测
+│   ├── vectorized.py            # 向量化回测 + 市场冲击模型
+│   └── performance.py           # 绩效指标 + BacktestResult
+│
+├── store/                       # 持久化
+│   ├── signal_store.py          # 信号/权重/元数据存储
+│   └── model_store.py           # 模型对象持久化
+│
+├── models/                      # 参考模型实现（示例，非核心架构）
+│   ├── linear_models.py         # SklearnModelWrapper（Ridge/Lasso/ElasticNet）
+│   ├── tree_models.py           # LGBMModelWrapper / XGBModelWrapper
+│   └── torch_base.py            # TorchModelBase（PyTorch 基类）
+│
+└── tests/                       # 单元测试
+    ├── test_types.py            # 协议 + 配置类验证
+    ├── test_preprocessing.py    # 对齐 + 标准化 + 特征矩阵 + 因子筛选
+    ├── test_training.py         # 切分器 + Walk-Forward + Trainer
+    ├── test_signal.py           # 信号生成 + EMA 平滑
+    ├── test_portfolio.py        # beta + 协方差 + 约束 + 组合构建 + vol targeting
+    ├── test_backtest.py         # 绩效指标 + 向量化回测 + 市场冲击
+    ├── test_store.py            # SignalStore + ModelStore
+    ├── test_models.py           # 参考模型封装
+    └── test_pipeline.py         # AlphaPipeline 端到端
+```
+
+**依赖方向（只能向下依赖，不能向上）：**
+
+```
+pipeline.py → training/ + signal/ + portfolio/ + backtest/ + store/
+                   ↓           ↓          ↓           ↓
+              preprocessing/ → core/types.py ← config.py
+                   ↓
+         factor_research.store (Phase 2a)
+         data_infra.data (Phase 1)
+```
+
+**与其他阶段的接口：**
+
+```
+Phase 2a (因子研究)           Phase 2b (模型策略)           Phase 3 (实盘)
+FactorStore.load()  ──→  preprocessing/  ──→  ...  ──→  SignalStore  ──→  ...
+                         (alignment,                    (weights.parquet)
+                          transform,
+                          selection)
+```
+
+---
+
+## 二、建议学习路线
+
+```
+第1站 alpha_model/core/types.py          ← 理解协议和数据类
+  ↓
+第2站 alpha_model/preprocessing/ (3个文件) ← 理解数据怎么变成特征矩阵
+  ↓
+第3站 alpha_model/training/ (3个文件)      ← 理解 Walk-Forward 如何防止过拟合
+  ↓
+第4站 alpha_model/signal/ (2个文件)        ← 理解预测值怎么变成信号
+  ↓
+第5站 alpha_model/portfolio/ (5个文件)     ← 理解信号怎么变成目标权重（凸优化）
+  ↓
+第6站 alpha_model/backtest/ (2个文件)      ← 理解权重怎么计算 P&L
+  ↓
+第7站 alpha_model/store/ (2个文件)         ← 理解策略输出怎么持久化
+  ↓
+第8站 alpha_model/models/ (3个文件)        ← 理解参考模型封装（不是核心架构）
+  ↓
+第9站 alpha_model/core/pipeline.py       ← 理解如何串联全链路
+  ↓
+第10站 alpha_model/tests/ (8个文件)       ← 理解如何测试、学习 mock 技巧
+```
+
+---
+
+## 三、第 1 站：核心类型 core/types.py
+
+### 文件：`alpha_model/core/types.py`
+
+这是整个 Phase 2b 的**地基**。所有模块都引用这里定义的协议和数据类。
+
+**核心知识点：**
+
+1. **Protocol（协议）vs ABC（抽象基类）**
+
+Python 3.8+ 引入的 `typing.Protocol` 实现了**结构化子类型**（structural subtyping），也叫"鸭子类型的静态版本"。只要一个类实现了协议要求的方法，无需继承即可满足协议。
+
+```python
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class AlphaModel(Protocol):
+    def fit(self, X: pd.DataFrame, y: pd.Series, **kwargs) -> None: ...
+    def predict(self, X: pd.DataFrame) -> np.ndarray | pd.Series: ...
+```
+
+为什么用 Protocol 而不用 ABC？因为 sklearn 原生模型已有 `fit/predict` 方法，无需继承任何基类即可直接使用：
+
+```python
+from sklearn.linear_model import Ridge
+
+model = Ridge(alpha=1.0)
+isinstance(model, AlphaModel)  # True! 天然满足协议
+```
+
+2. **`@runtime_checkable` 装饰器**
+
+让 `isinstance(obj, AlphaModel)` 在运行时可用。没有此装饰器，`isinstance` 检查会抛 `TypeError`。
+
+3. **AlphaModel 协议的方法分层**
+
+```
+必须实现（核心）:
+    fit(X, y, **kwargs)     — 训练模型
+    predict(X)              — 生成预测值
+
+可选实现（增强）:
+    save_model(path)        — 保存模型到指定目录
+    load_model(path)        — 从指定目录加载模型
+    get_feature_importance() — 返回因子重要性
+    get_params()            — 返回模型参数
+```
+
+4. **TrainMode 和 WalkForwardMode 枚举**
+
+```python
+class TrainMode(Enum):
+    POOLED = "pooled"           # 所有标的堆叠为一个训练集
+    PER_SYMBOL = "per_symbol"   # 每个标的独立训练
+
+class WalkForwardMode(Enum):
+    EXPANDING = "expanding"     # 训练窗口起点固定，终点前进
+    ROLLING = "rolling"         # 训练窗口固定大小，整体滑动
+```
+
+5. **TrainConfig 数据类**
+
+```python
+@dataclass
+class TrainConfig:
+    train_mode: TrainMode = TrainMode.POOLED
+    wf_mode: WalkForwardMode = WalkForwardMode.EXPANDING
+    target_horizon: int = 10        # 前瞻窗口（bar 数）
+    train_periods: int = 5000       # 训练窗口长度
+    test_periods: int = 1000        # 测试窗口长度
+    purge_periods: int = 60         # 隔离期（必须 >= target_horizon）
+```
+
+`__post_init__` 中有严格的参数校验：
+- `target_horizon >= 1`
+- `purge_periods >= target_horizon`（防止 forward return 标签泄漏）
+
+6. **PortfolioConstraints 数据类**
+
+```python
+@dataclass
+class PortfolioConstraints:
+    max_weight: float = 0.4         # 单标的最大绝对权重
+    dollar_neutral: bool = True     # 多空等金额 Σw_i = 0
+    beta_neutral: bool = False      # 对市场方向中性 β'w = 0
+    beta_lookback: int = 60         # beta 估计窗口（天数）
+    vol_target: float | None = None # 年化波动率目标
+    vol_lookback: int = 60          # 波动率估计窗口
+    leverage_cap: float = 2.0       # 最大杠杆 Σ|w_i|
+    risk_aversion: float = 1.0      # 风险厌恶系数 λ
+    turnover_penalty: float = 0.01  # 换手率惩罚系数 γ
+```
+
+三层约束的数学表达：
+```
+第一层: |w_i| ≤ max_weight        （防止单标的过度集中）
+第二层: Σ w_i = 0                 （多空对冲）
+第三层: β'w = 0                   （市场中性）
+第四层: Σ|w_i| ≤ leverage_cap     （杠杆上限）
+```
+
+7. **ModelMeta 元数据类**
+
+记录策略的完整配置，确保可复现性。提供 `to_dict()` 和 `from_dict()` 实现 JSON 序列化/反序列化往返。
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 33-73 | AlphaModel Protocol | Protocol 模式、`@runtime_checkable`、方法签名设计 |
+| 112-121 | TrainMode / WalkForwardMode | Enum 类型的使用 |
+| 128-176 | TrainConfig | dataclass + `__post_init__` 验证 |
+| 178-232 | PortfolioConstraints | 三层约束的参数设计 |
+| 235-328 | ModelMeta | 序列化/反序列化往返、`from_dict` 的 `get` 默认值技巧 |
+
+**动手练习：**
+
+```python
+from alpha_model.core.types import *
+
+# 1. 验证 sklearn 原生模型天然满足协议
+from sklearn.linear_model import Ridge
+model = Ridge(alpha=1.0)
+print(isinstance(model, AlphaModel))  # → True
+
+# 2. 验证不完整的类不满足协议
+class BadModel:
+    def fit(self, X, y): pass
+    # 没有 predict 方法
+print(isinstance(BadModel(), AlphaModel))  # → False
+
+# 3. 创建配置并尝试违反约束
+try:
+    TrainConfig(target_horizon=10, purge_periods=5)  # purge < horizon → 报错
+except ValueError as e:
+    print(f"预期的错误: {e}")
+
+# 4. ModelMeta 序列化往返
+meta = ModelMeta(
+    name="test", factor_names=["f1", "f2"],
+    target_horizon=10,
+    train_config=TrainConfig(),
+    constraints=PortfolioConstraints(),
+)
+d = meta.to_dict()
+restored = ModelMeta.from_dict(d)
+print(restored.name == meta.name)  # → True
+```
+
+**思考题：**
+1. 为什么 `AlphaModel` 使用 Protocol 而不是 ABC？（答：让 sklearn 原生模型免继承直接使用）
+2. 为什么 `purge_periods` 必须 >= `target_horizon`？（答：forward return 标签窗口会延伸到未来 h 个 bar，purge 必须覆盖这个窗口以防止标签泄漏）
+3. `PortfolioConstraints` 中 `risk_aversion` 和 `turnover_penalty` 为什么允许为 0？（答：risk_aversion=0 意味着纯 alpha 最大化，turnover_penalty=0 意味着不惩罚换手）
+
+---
+
+## 四、第 2 站：预处理 preprocessing/
+
+### 4.1 `alpha_model/preprocessing/alignment.py` — 多频率因子对齐
+
+**核心知识点：**
+- **不同频率因子的统一**：orderbook 因子可能是 10 秒频率，kline 因子是 1 分钟，需要对齐到统一时间网格
+- **频率推断**：通过计算相邻时间戳的中位数差值自动推断
+- **对齐策略**：取所有因子中最低频率（最大间隔）作为目标频率，高频向低频重采样
+- **前向填充（ffill）**：高频因子对齐到低频网格时，用最近一个有效值填充
+- **max_gap 控制**：限制最大前向填充步数，防止过度填充
+
+```python
+from alpha_model.preprocessing.alignment import align_factor_panels
+
+# 有一个 1min 因子和一个 5min 因子
+aligned = align_factor_panels(
+    {"fast_factor": panel_1min, "slow_factor": panel_5min},
+    fill_method="ffill",  # 前向填充
+    max_gap=3,            # 最多填充 3 步
+)
+# 两个面板的时间索引现在完全相同（5min 频率）
+```
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 21-38 | `_infer_freq` | 通过中位数推断频率（鲁棒于缺失行） |
+| 70-82 | 自动推断 vs 手动指定 | `to_offset` 将字符串转为频率对象 |
+| 84-106 | 时间网格构建 | 取交集 + `pd.date_range` 生成统一索引 |
+| 112-136 | 逐面板对齐 | `reindex` + `ffill(limit=max_gap)` |
+
+### 4.2 `alpha_model/preprocessing/transform.py` — 标准化工具箱 + 特征矩阵构建
+
+**核心知识点：**
+
+1. **标准化是工具箱，不是管道步骤**
+
+这是一个重要的设计决策。标准化不硬编码在管道中，而是作为独立工具函数提供：
+- 树模型（LightGBM/XGBoost）对单调变换不敏感，不需要标准化
+- 线性模型需要标准化，但 expanding/rolling/截面 z-score 各有优劣
+- 选择哪种标准化是"研究决策"，不应由框架替用户做选择
+
+2. **四种标准化方式**
+
+```python
+# 时序标准化（逐列独立，无截面交互）
+expanding_zscore(panel, min_periods=252)   # z = (x - expanding_mean) / expanding_std
+rolling_zscore(panel, window=1000)         # z = (x - rolling_mean) / rolling_std
+
+# 截面标准化（每行独立，无时序交互）
+cross_sectional_zscore(panel)              # 每行做 z-score
+cross_sectional_rank(panel)                # 每行做百分位排名 [0, 1]
+```
+
+3. **无未来信息保证**
+- expanding/rolling：只看当前及之前的数据
+- 截面标准化：在每个时刻独立计算，不涉及时序方向
+
+4. **Winsorize 去极值**
+
+```python
+winsorize(panel, sigma=3.0, method="expanding")
+# 将超过 ±3σ 的值截断到边界值
+# method 可选: "expanding", "rolling", "cross_sectional"
+```
+
+5. **特征矩阵构建 `build_feature_matrix`**
+
+将多个因子面板合并为模型输入的特征矩阵。两种模式的输出格式不同：
+
+```python
+# Pooled 模式: 所有 symbol 堆叠
+X = build_feature_matrix(factor_panels, symbols, TrainMode.POOLED)
+# X.index = MultiIndex(timestamp, symbol)
+# X.columns = factor_names
+
+# Per-Symbol 模式: 每个 symbol 独立
+X = build_feature_matrix(factor_panels, symbols, TrainMode.PER_SYMBOL)
+# X = {"BTC/USDT": DataFrame, "ETH/USDT": DataFrame, ...}
+```
+
+6. **`build_pooled_target` 构建 Pooled 目标变量**
+
+将 `fwd_returns (timestamp x symbol)` 重塑为与 X 同样的 MultiIndex 格式：
+
+```python
+y = build_pooled_target(X, fwd_returns, symbols)
+# y.index = MultiIndex(timestamp, symbol)，与 X 完全对齐
+```
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 40-65 | `expanding_zscore` | `panel.expanding(min_periods).mean/std`，std=0 返回 NaN |
+| 68-92 | `rolling_zscore` | expanding vs rolling 的权衡 |
+| 99-138 | 截面标准化 | `panel.mean(axis=1)` 逐行计算、`sub/div` 广播 |
+| 145-201 | `winsorize` | 三种方式的去极值，注意 `np.tile` 的形状对齐技巧 |
+| 208-296 | `build_feature_matrix` | Pooled 堆叠逻辑、MultiIndex 构建、`set_index(append=True)` |
+| 302-337 | `build_pooled_target` | 从面板格式到 MultiIndex Series 的转换 |
+
+### 4.3 `alpha_model/preprocessing/selection.py` — 因子筛选
+
+**核心知识点：**
+
+因子筛选是**可选步骤**（树模型可跳过），支持三种模式：
+
+1. **threshold 模式（三步过滤）：**
+   - Step 1: 按 IC/MI/单调性评分，过滤低于阈值的因子
+   - Step 2: VIF 过滤共线性因子（逐步移除 VIF 最高的）
+   - Step 3: 贪心增量 IC 筛选（逐个加入，保留增量贡献够大的）
+
+2. **top_k 模式：**
+   - 对每个因子计算多维评分（IC、MI、单调性）
+   - 归一化后加权综合评分
+   - 排序取前 k 个
+
+3. **族级筛选 `select_from_families`：**
+   - 对每个因子族，选出最优变体
+   - 跨族执行 `select_factors()` 进一步过滤
+
+```python
+from alpha_model.preprocessing.selection import select_factors, select_from_families
+
+# threshold 模式
+selected = select_factors(
+    factor_panels, price_panel,
+    mode="threshold", metric="ic",
+    min_ic=0.02, max_vif=10.0,
+    min_incremental_ic=0.005,
+    min_factors=3,
+)
+
+# top_k 模式
+selected = select_factors(
+    factor_panels, price_panel,
+    mode="top_k", top_k=5,
+    score_weights={"ic": 0.5, "mi": 0.3, "monotonicity": 0.2},
+)
+
+# 族级筛选
+selected = select_from_families(
+    family_names=["momentum", "volatility"],
+    price_panel=price_panel,
+    family_select_metric="ic_mean",
+)
+```
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 42-81 | `_score_factor` | 复用 Phase 2a 的 `ic_analysis`, `nonlinear_analysis`, `quantile_backtest` |
+| 88-215 | `_threshold_select` | VIF 逐步删除（while 循环）、贪心增量 IC |
+| 222-274 | `_topk_select` | 多维评分归一化、加权综合 |
+| 346-416 | `select_from_families` | 族内选优 + 跨族过滤的两层架构 |
+
+---
+
+## 五、第 3 站：训练框架 training/
+
+### 5.1 `alpha_model/training/splitter.py` — 时序切分器
+
+**核心知识点：**
+
+1. **为什么不用 sklearn 的 TimeSeriesSplit？**
+
+sklearn 的 `TimeSeriesSplit` 没有 **embargo period**（隔离期）。在金融时序中，训练集末尾的 forward return 标签与测试集开头的数据存在重叠（标签窗口延伸到了测试集），会导致**前瞻偏差**。
+
+2. **Embargo period 的计算**
+
+```python
+embargo_periods = max(target_horizon, max_factor_lookback)
+```
+
+两个泄漏源都要覆盖：
+- `target_horizon`：forward return 标签的窗口长度
+- `max_factor_lookback`：因子计算中使用的最大 rolling window
+
+3. **Fold 数据类**
+
+```python
+@dataclass
+class Fold:
+    fold_id: int
+    train_start: int       # 训练集起始索引（含）
+    train_end: int         # 训练集结束索引（不含）
+    test_start: int        # 测试集起始索引（含）
+    test_end: int          # 测试集结束索引（不含）
+```
+
+4. **两种模式的切分逻辑**
+
+```
+Expanding 模式（训练数据越来越多）:
+Fold 0: |===TRAIN===|--embargo--|==TEST==|
+Fold 1: |=========TRAIN=========|--embargo--|==TEST==|
+Fold 2: |===============TRAIN===============|--embargo--|==TEST==|
+
+Rolling 模式（训练窗口固定大小）:
+Fold 0: |===TRAIN===|--embargo--|==TEST==|
+Fold 1:       |===TRAIN===|--embargo--|==TEST==|
+Fold 2:             |===TRAIN===|--embargo--|==TEST==|
+```
+
+```python
+from alpha_model.training.splitter import TimeSeriesSplitter
+from alpha_model.core.types import WalkForwardMode
+
+splitter = TimeSeriesSplitter(
+    train_periods=3000,
+    test_periods=1000,
+    target_horizon=10,
+    max_factor_lookback=60,    # embargo = max(10, 60) = 60
+    mode=WalkForwardMode.EXPANDING,
+)
+
+folds = splitter.split(n_samples=10000)
+for fold in folds:
+    print(f"Fold {fold.fold_id}: "
+          f"train [{fold.train_start}:{fold.train_end}] "
+          f"test [{fold.test_start}:{fold.test_end}] "
+          f"gap={fold.test_start - fold.train_end}")
+```
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 27-51 | Fold 数据类 | `@property` 计算属性 |
+| 73-111 | `__init__` | 参数校验 + embargo 自动计算 |
+| 113-210 | `split` | Expanding vs Rolling 的循环逻辑、最后一个 fold 的截断处理 |
+
+### 5.2 `alpha_model/training/walk_forward.py` — Walk-Forward 引擎
+
+**核心知识点：**
+
+1. **WalkForwardResult 结果数据类**
+
+```python
+@dataclass
+class WalkForwardResult:
+    predictions: pd.DataFrame         # 样本外预测面板 (timestamp × symbol)
+    fold_metrics: list[dict]          # 每个 fold 的 IC 等评估指标
+    feature_importance: pd.DataFrame  # 因子重要性（各 fold 平均）
+    train_config: TrainConfig | None
+```
+
+2. **Pooled 模式的流程**
+
+```python
+# 按 timestamp 分组确定唯一时间戳数量（用于切分）
+timestamps = X.index.get_level_values("timestamp").unique().sort_values()
+folds = splitter.split(len(timestamps))
+
+for fold in folds:
+    # 用时间戳索引取切分
+    train_ts = timestamps[fold.train_start:fold.train_end]
+    test_ts = timestamps[fold.test_start:fold.test_end]
+
+    # 布尔掩码选择行
+    train_mask = X.index.get_level_values("timestamp").isin(train_ts)
+    X_train = X.loc[train_mask]
+    # ...
+
+    # 每个 fold 使用模型的深拷贝，避免状态污染
+    fold_model = copy.deepcopy(self.model)
+    fold_model.fit(X_train, y_train)
+    preds = fold_model.predict(X_test)
+```
+
+3. **关键设计要点**
+- `copy.deepcopy(model)`：每个 fold 独立模型副本，避免状态互相污染
+- NaN 行在训练时删除（`X_train.notna().all(axis=1) & y_train.notna()`）
+- 因子重要性支持安全获取（`hasattr` + `try/except`）
+
+4. **IC 计算方式**
+- Pooled 模式：按 timestamp 分组计算截面 IC，取均值
+- Per-Symbol 模式：直接计算 Spearman IC
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 111-217 | `_run_pooled` | MultiIndex 时间戳切分技巧、`deepcopy` 隔离 |
+| 219-310 | `_run_per_symbol` | 每个 symbol 独立 Walk-Forward |
+| 312-349 | `_compute_fold_ic` | 截面 IC 均值计算 |
+| 351-379 | `_get_importance` / `_average_importance` | 安全获取 + 多 fold 平均 |
+
+### 5.3 `alpha_model/training/trainer.py` — 训练调度器
+
+一站式接口：从因子面板和价格面板出发，自动完成特征构建、目标变量计算、Walk-Forward 训练。
+
+```python
+from alpha_model.training.trainer import Trainer
+from alpha_model.core.types import TrainConfig
+
+trainer = Trainer(
+    model=Ridge(alpha=1.0),
+    train_config=TrainConfig(
+        train_periods=3000, test_periods=1000,
+        target_horizon=10,
+    ),
+    max_factor_lookback=60,
+)
+result = trainer.run(factor_panels, price_panel, symbols)
+```
+
+`Trainer.run()` 内部做三件事：
+1. `build_feature_matrix(factor_panels, symbols, mode)` → X
+2. `compute_forward_returns_panel(price_panel, horizon)` → y
+3. `WalkForwardEngine(model, splitter, mode).run(X, y)` → result
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 60-141 | `run` | 自动推断 symbols、Pooled vs Per-Symbol 的 y 构建差异 |
+
+---
+
+## 六、第 4 站：信号生成 signal/
+
+### 6.1 `alpha_model/signal/generator.py` — 预测值到标准化信号
+
+**核心知识点：**
+
+1. **默认不截断极端值**
+
+这是一个有意的设计决策：模型输出的极端预测值可能正是信号强烈的证明。截断极端值会削弱策略的表达能力。真正的风控由 portfolio 层的约束（`max_weight`、`leverage_cap`）来实现。
+
+2. **两种标准化方式**
+
+```python
+from alpha_model.signal.generator import generate_signal
+
+# 截面 z-score（默认）
+signal = generate_signal(predictions, method="cross_sectional_zscore")
+# 每行: z = (x - mean) / std，均值 → 0，标准差 → 1
+
+# 截面百分位排名
+signal = generate_signal(predictions, method="cross_sectional_rank")
+# 每行: rank ∈ [0, 1]，无分布假设
+```
+
+3. **可选截断**
+
+```python
+# 截面 z-score + 3σ 截断
+signal = generate_signal(predictions, method="cross_sectional_zscore", clip_sigma=3.0)
+```
+
+### 6.2 `alpha_model/signal/smoother.py` — EMA 信号平滑
+
+```python
+from alpha_model.signal.smoother import ema_smooth
+
+# halflife 控制衰减速度
+smoothed = ema_smooth(signal, halflife=5)
+# halflife 越小 → 响应越快 → 换手越高
+# halflife 越大 → 越平滑 → 信号越滞后
+```
+
+底层使用 `pandas.DataFrame.ewm(halflife=halflife, min_periods=1).mean()`。
+
+**阅读重点：**
+
+| 文件 | 行范围 | 内容 | 学什么 |
+|------|--------|------|--------|
+| generator.py | 21-69 | `generate_signal` | 截面 z-score、`replace(0, np.nan)` 处理零方差 |
+| smoother.py | 12-35 | `ema_smooth` | `ewm` 参数含义、halflife 与 alpha 的关系 |
+
+---
+
+## 七、第 5 站：组合构建 portfolio/
+
+### 7.1 `alpha_model/portfolio/beta.py` — 滚动 Beta 估计
+
+**核心知识点：**
+
+```
+beta_i = Cov(r_i, r_market) / Var(r_market)
+```
+
+使用 pandas 的 `rolling().cov()` 和 `rolling().var()` 实现：
+
+```python
+from alpha_model.portfolio.beta import rolling_beta
+
+betas = rolling_beta(returns_panel, market_symbol="BTC/USDT", lookback=60)
+# betas["BTC/USDT"] 恒为 1.0（市场自身）
+# betas["ETH/USDT"] ≈ 0.8~1.2（与市场正相关）
+```
+
+### 7.2 `alpha_model/portfolio/covariance.py` — 协方差矩阵估计
+
+**核心知识点：**
+
+1. **Ledoit-Wolf Shrinkage**
+
+样本协方差矩阵在 T/N（样本数/资产数）比较小时估计误差极大。Ledoit-Wolf 收缩将样本协方差向一个结构化目标"收缩"：
+
+```
+Σ_shrunk = δ × F + (1-δ) × S
+F = 结构化目标（对角矩阵，只保留方差）
+S = 样本协方差矩阵
+δ = 最优收缩强度（数据驱动，自动计算）
+```
+
+2. **三种估计方法**
+
+```python
+from alpha_model.portfolio.covariance import estimate_covariance
+
+# Ledoit-Wolf（推荐）
+cov = estimate_covariance(returns_panel, lookback=60, method="ledoit_wolf")
+
+# 样本协方差（仅用于对比）
+cov = estimate_covariance(returns_panel, lookback=60, method="sample")
+
+# 指数加权协方差
+cov = estimate_covariance(returns_panel, lookback=60, method="exponential")
+```
+
+3. **滚动协方差 `rolling_covariance`**
+
+逐时刻计算协方差矩阵序列，返回 `{timestamp: np.ndarray}` 字典。
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 35-86 | `estimate_covariance` | `LedoitWolf().fit(data.values).covariance_` 的用法 |
+| 89-142 | `rolling_covariance` | 滚动窗口估计、dropna 后数据质量预警 |
+
+### 7.3 `alpha_model/portfolio/constraints.py` — cvxpy 约束生成器
+
+**核心知识点：**
+
+所有约束被建模为 cvxpy 约束表达式，**联合传入优化器求解**。不再有顺序应用的问题——所有约束同时满足。
+
+```python
+import cvxpy as cp
+from alpha_model.portfolio.constraints import build_constraints
+
+w = cp.Variable(5)  # 5 个标的的权重
+config = PortfolioConstraints(
+    max_weight=0.4,
+    dollar_neutral=True,
+    beta_neutral=True,
+    leverage_cap=2.0,
+)
+beta = np.array([1.0, 0.9, 1.2, 0.8, 1.1])
+
+constraints = build_constraints(w, config, beta=beta)
+# 返回的 constraints 列表:
+# [cp.abs(w) <= 0.4,           第一层: 仓位上限
+#  cp.sum(w) == 0,             第二层: dollar-neutral
+#  beta @ w == 0,              第三层: beta-neutral
+#  cp.norm(w, 1) <= 2.0]       第四层: 杠杆上限
+```
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 40-78 | `build_constraints` | cvxpy 约束表达式写法、`TYPE_CHECKING` 延迟导入 |
+
+### 7.4 `alpha_model/portfolio/risk_budget.py` — 波动率目标 (Vol Targeting)
+
+**核心知识点：**
+
+动态调整组合杠杆，使组合的预期年化波动率稳定在目标水平。
+
+```
+realized_vol = 组合最近 N 行的年化波动率
+scale_factor = target_vol / realized_vol
+adjusted_weights = original_weights * scale_factor
+
+波动率高于目标 → 缩小仓位
+波动率低于目标 → 放大仓位
+```
+
+受 `leverage_cap` 约束：缩放后 `Σ|w_i|` 不超过杠杆上限。
+
+```python
+from alpha_model.portfolio.risk_budget import apply_vol_target
+
+adjusted = apply_vol_target(
+    weights, price_panel,
+    vol_target=0.15,     # 15% 年化波动率
+    lookback=60,
+    leverage_cap=2.0,
+)
+```
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 25-84 | `apply_vol_target` | 滞后权重计算组合收益率、`MINUTES_PER_YEAR` 年化、杠杆上限约束 |
+
+### 7.5 `alpha_model/portfolio/constructor.py` — 凸优化组合构建器（核心）
+
+**核心知识点：**
+
+1. **Mean-Variance 优化的 QP 形式**
+
+```
+minimize    w'Σw - λα'w + γ||w - w_prev||₁
+subject to  |w_i| ≤ max_weight
+            Σw_i = 0                      (dollar-neutral, 可选)
+            β'w = 0                       (beta-neutral, 可选)
+            ||w||₁ ≤ leverage_cap
+
+其中:
+    w     = 权重向量（决策变量）
+    Σ     = 协方差矩阵（Ledoit-Wolf 估计）
+    α     = alpha 向量（信号值）
+    λ     = 风险厌恶系数
+    γ     = 换手率惩罚系数
+    w_prev = 上一期权重
+```
+
+2. **逐期求解**
+
+`PortfolioConstructor.construct()` 对信号面板的每个时间戳逐期求解 QP 问题，通过 `prev_w` 追踪上一期权重用于换手率惩罚：
+
+```python
+from alpha_model.portfolio.constructor import PortfolioConstructor
+
+constructor = PortfolioConstructor(
+    PortfolioConstraints(
+        dollar_neutral=True,
+        max_weight=0.4,
+        risk_aversion=1.0,
+        turnover_penalty=0.01,
+    )
+)
+weights = constructor.construct(signal, price_panel)
+```
+
+3. **协方差矩阵的正半定保证**
+
+优化求解前，检查协方差矩阵的最小特征值。如果非正半定，加微小正则项：
+
+```python
+min_eig = np.linalg.eigvalsh(cov_matrix).min()
+if min_eig < 0:
+    cov_matrix += (-min_eig + 1e-8) * np.eye(n)
+```
+
+4. **Infeasible 退化处理**
+
+当约束矛盾导致优化问题无解（infeasible）时，退化为安全权重（dollar-neutral → 全零，否则等权）。
+
+5. **Vol Targeting 事后缩放**
+
+优化求解得到权重后，如果配置了 `vol_target`，再调用 `apply_vol_target` 做事后缩放。
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 56-170 | `construct` | 逐期求解循环、NaN 信号处理、协方差估计的无前瞻保证 |
+| 172-232 | `_solve_single_period` | cvxpy 建模全过程、正半定修正、OSQP 求解器 |
+
+**动手练习：**
+
+```python
+import cvxpy as cp
+import numpy as np
+
+# 手写一个最简单的 Mean-Variance 优化
+n = 3
+alpha = np.array([0.5, -0.3, 0.1])   # alpha 信号
+cov = np.eye(3) * 0.01                # 简化为对角协方差
+
+w = cp.Variable(n)
+risk = cp.quad_form(w, cov)            # w'Σw
+ret = alpha @ w                        # α'w
+objective = cp.Minimize(risk - ret)    # 风险 - 收益
+
+constraints = [
+    cp.abs(w) <= 0.4,                  # 仓位上限
+    cp.sum(w) == 0,                    # dollar-neutral
+    cp.norm(w, 1) <= 2.0,             # 杠杆上限
+]
+
+prob = cp.Problem(objective, constraints)
+prob.solve(solver=cp.OSQP)
+print(f"最优权重: {w.value}")
+print(f"权重之和: {w.value.sum():.6f}")  # 应接近 0
+```
+
+---
+
+## 八、第 6 站：向量化回测 backtest/
+
+### 8.1 `alpha_model/backtest/vectorized.py` — 向量化回测
+
+**核心知识点：**
+
+1. **P&L 计算公式**
+
+```
+portfolio_return_t = Σ(w_{i,t-1} × r_{i,t})
+```
+
+用上一期（t-1）的权重乘以本期（t）的收益率。代码中通过 `weights.shift(1)` 实现滞后。
+
+2. **两层交易成本模型**
+
+```
+第一层: 固定手续费
+    fee = turnover × fee_rate
+    turnover = Σ|Δw_i|（权重变化的绝对值之和）
+
+第二层: 市场冲击（Square-root model）
+    impact_i = impact_coeff × σ_i × √(|ΔV_i| / ADV_i)
+    其中 ΔV_i = |Δw_i| × portfolio_value
+```
+
+3. **Square-root 市场冲击模型的直觉**
+
+```python
+from alpha_model.backtest.vectorized import estimate_market_impact
+
+impact = estimate_market_impact(
+    delta_weights,    # 权重变化面板
+    adv_panel,        # 日均成交量面板 (USDT)
+    volatility_panel, # 滚动波动率面板
+    portfolio_value,  # 组合总资金
+    impact_coeff=0.1, # 冲击系数
+)
+```
+
+为什么用 `sqrt`？因为市场冲击与交易规模不是线性关系——小额交易几乎无冲击，大额交易冲击迅速增大但最终趋于饱和。`sqrt` 是实证中最常用的近似。
+
+4. **向量化回测的局限**
+
+向量化回测假设在 t-1 时刻设定的权重在 t 时刻完美执行。实际中有：
+- 下单延迟
+- 部分成交
+- 滑点
+这些需要 Phase 3 的事件驱动回测来模拟。
+
+```python
+from alpha_model.backtest.vectorized import vectorized_backtest
+
+result = vectorized_backtest(
+    weights, price_panel,
+    fee_rate=0.0004,         # Binance taker 0.04%
+    impact_coeff=0.1,
+    adv_panel=None,          # None → 纯手续费模型
+    portfolio_value=10000,
+)
+print(result.summary())
+```
+
+### 8.2 `alpha_model/backtest/performance.py` — 绩效指标
+
+**核心知识点：**
+
+复用 Phase 2a 的基础指标，新增策略级指标：
+
+```python
+# Phase 2a 复用
+from factor_research.evaluation.metrics import (
+    sharpe_ratio, max_drawdown, annualize_return,
+    annualize_volatility, cumulative_returns,
+)
+
+# Phase 2b 新增
+sortino_ratio(returns)          # 只惩罚下行波动率
+calmar_ratio(returns)           # 年化收益 / |最大回撤|
+max_drawdown_duration(returns)  # 最长回撤持续期（bar 数）
+```
+
+**Sortino ratio 的意义：**
+Sharpe ratio 对正负波动率一视同仁，但投资者通常不介意"赚多了"。Sortino 只用下行波动率做分母，更符合直觉。
+
+**BacktestResult 数据类：**
+
+```python
+@dataclass
+class BacktestResult:
+    equity_curve: pd.Series         # 净值曲线 (1.0 起始)
+    returns: pd.Series              # 逐期净收益率
+    turnover: pd.Series             # 逐期换手率
+    weights_history: pd.DataFrame   # 权重历史
+    gross_returns: pd.Series | None # 毛收益
+    total_cost: float               # 总交易成本
+
+    def summary(self) -> dict:
+        # 返回 12 个绩效指标的字典
+```
+
+`summary()` 返回的完整指标列表：
+```
+annual_return        — 年化收益率
+annual_volatility    — 年化波动率
+sharpe_ratio         — 夏普比率
+sortino_ratio        — Sortino 比率
+calmar_ratio         — Calmar 比率
+max_drawdown         — 最大回撤
+max_drawdown_duration — 最长回撤持续期
+avg_turnover         — 平均换手率
+total_cost           — 总交易成本
+win_rate             — 胜率
+n_periods            — 总期数
+total_return         — 总收益率
+```
+
+**阅读重点：**
+
+| 文件 | 行范围 | 内容 | 学什么 |
+|------|--------|------|--------|
+| vectorized.py | 42-74 | `estimate_market_impact` | sqrt-model 公式实现 |
+| vectorized.py | 77-153 | `vectorized_backtest` | `shift(1)` 滞后权重、`diff()` 计算换手率 |
+| performance.py | 37-63 | `sortino_ratio` | 下行波动率的计算方式 |
+| performance.py | 88-111 | `max_drawdown_duration` | `cummax` 求高水位、连续回撤计数 |
+
+---
+
+## 九、第 7 站：持久化 store/
+
+### 9.1 `alpha_model/store/signal_store.py` — 策略输出持久化
+
+**核心知识点：**
+
+SignalStore 是 Phase 2b → Phase 3 的**唯一输出接口**。
+
+存储结构：
+```
+db/signals/{strategy_name}/
+├── weights.parquet        # 目标权重面板
+├── signals.parquet        # 原始信号面板（调试用）
+├── meta.json              # ModelMeta 序列化
+└── performance.json       # BacktestResult.summary()
+```
+
+1. **原子写入**（与 Phase 1 一致）：先写 `.tmp` 目录，完成后 `os.rename` 原子替换，防止写入中断导致数据损坏。
+
+2. **Parquet 格式**：带 `timestamp` 列，保持与 FactorStore 风格一致。
+
+```python
+from alpha_model.store.signal_store import SignalStore
+
+store = SignalStore()
+
+# 保存
+store.save(
+    strategy_name="ridge_momentum_v1",
+    weights=weights_df,
+    signals=signal_df,
+    meta=model_meta,
+    performance=backtest_result.summary(),
+)
+
+# 加载
+weights = store.load_weights("ridge_momentum_v1")
+meta = store.load_meta("ridge_momentum_v1")
+perf = store.load_performance("ridge_momentum_v1")
+
+# 列出所有策略
+print(store.list_strategies())
+```
+
+### 9.2 `alpha_model/store/model_store.py` — 模型持久化
+
+**核心知识点：**
+
+存储结构：
+```
+db/models/{model_name}/
+├── model/                 # 模型文件目录
+│   └── model.joblib       # 或 model.pt / model.txt
+├── meta.json              # ModelMeta
+└── importance.json        # 因子重要性排名
+```
+
+1. **ModelStore 不假设模型的序列化格式**。它调用 `model.save_model(path)` 和 `model.load_model(path)`，由模型自行决定如何保存/加载。
+
+2. **加载时需要 `model_factory`**：因为 ModelStore 不知道模型的类型，需要用户提供一个工厂函数创建空模型实例。
+
+```python
+from alpha_model.store.model_store import ModelStore
+
+store = ModelStore()
+
+# 保存
+store.save("ridge_v1", model, meta, importance={"f1": 0.8, "f2": 0.2})
+
+# 加载（需要提供工厂函数）
+model, meta = store.load(
+    "ridge_v1",
+    model_factory=lambda: SklearnModelWrapper(Ridge(alpha=1.0)),
+)
+
+# 加载因子重要性
+importance = store.load_importance("ridge_v1")
+```
+
+**阅读重点：**
+
+| 文件 | 行范围 | 内容 | 学什么 |
+|------|--------|------|--------|
+| signal_store.py | 46-107 | `save` | 原子写入: `.tmp` 目录 → `os.rename` |
+| signal_store.py | 160-175 | `_save_parquet` / `_load_parquet` | Parquet 格式约定 |
+| model_store.py | 49-110 | `save` | `hasattr(model, "save_model")` 安全检查 |
+| model_store.py | 112-150 | `load` | `model_factory()` 工厂模式 |
+
+---
+
+## 十、第 8 站：参考模型 models/
+
+这些是**示例代码**，不是核心架构。用户完全可以不用这些封装，只要自己的模型实现了 `fit/predict` 即可。
+
+### 10.1 `alpha_model/models/linear_models.py` — SklearnModelWrapper
+
+封装 sklearn 的线性模型，补充 `save_model/load_model/get_feature_importance`：
+
+```python
+from alpha_model.models.linear_models import SklearnModelWrapper
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+
+model = SklearnModelWrapper(Ridge(alpha=1.0))
+# 也可以: SklearnModelWrapper(Lasso(alpha=0.01))
+# 也可以: SklearnModelWrapper(ElasticNet(alpha=0.1, l1_ratio=0.5))
+
+model.fit(X, y)
+preds = model.predict(X)
+model.save_model(path)              # → model.joblib
+importance = model.get_feature_importance()  # → |coef_|
+```
+
+### 10.2 `alpha_model/models/tree_models.py` — LGBMModelWrapper / XGBModelWrapper
+
+```python
+from alpha_model.models.tree_models import LGBMModelWrapper
+
+model = LGBMModelWrapper(
+    objective="regression",
+    num_leaves=31,
+    learning_rate=0.05,
+    n_estimators=100,
+)
+model.fit(X, y)
+importance = model.get_feature_importance()  # → gain-based importance
+model.save_model(path)  # → model.txt
+```
+
+XGBModelWrapper 类似，保存格式为 `model.json`。
+
+注意：`lightgbm` 和 `xgboost` 是**可选依赖**。未安装时 import 模块不报错，但实例化时抛 `ImportError`。
+
+### 10.3 `alpha_model/models/torch_base.py` — TorchModelBase
+
+用户继承此基类，只需实现 `build_network()` 方法：
+
+```python
+from alpha_model.models.torch_base import TorchModelBase
+import torch.nn as nn
+
+class MyMLP(TorchModelBase):
+    def build_network(self, n_features):
+        return nn.Sequential(
+            nn.Linear(n_features, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+model = MyMLP(
+    val_ratio=0.2,     # 验证集比例（尾部按时间切分）
+    patience=10,       # early stopping 容忍轮次
+    max_epochs=100,
+    batch_size=256,
+    lr=1e-3,
+    device="auto",     # 自动选 GPU/CPU
+)
+model.fit(X, y)
+```
+
+**`fit` 方法自动处理的完整流程：**
+1. DataFrame → numpy float32
+2. 删除 NaN 行
+3. 按时间顺序拆分 train/val（尾部 `val_ratio` 为验证集）
+4. Tensor → DataLoader
+5. 训练循环（epoch, batch, gradient descent）
+6. 验证集 early stopping
+7. 加载 best checkpoint
+
+**关键设计：验证集按时间顺序切分（不是随机切分），避免前瞻偏差。**
+
+**阅读重点：**
+
+| 文件 | 行范围 | 内容 | 学什么 |
+|------|--------|------|--------|
+| linear_models.py | 25-83 | `SklearnModelWrapper` | 通用封装模式、`joblib` 序列化 |
+| tree_models.py | 19-91 | `LGBMModelWrapper` | `lgb.Dataset` + `lgb.train` 的用法 |
+| torch_base.py | 89-177 | `fit` | 完整的 PyTorch 训练循环、early stopping |
+| torch_base.py | 179-196 | `predict` | `eval()` + `no_grad()` + Tensor→numpy |
+
+---
+
+## 十一、第 9 站：AlphaPipeline 端到端 core/pipeline.py
+
+### 文件：`alpha_model/core/pipeline.py`
+
+AlphaPipeline 串联全链路，一键执行 8 个步骤：
+
+```python
+from sklearn.linear_model import Ridge
+from alpha_model.core.pipeline import AlphaPipeline
+from alpha_model.core.types import TrainConfig, PortfolioConstraints
+
+pipeline = AlphaPipeline(
+    model=Ridge(alpha=1.0),
+    train_config=TrainConfig(
+        train_periods=3000, test_periods=1000,
+        target_horizon=10, purge_periods=60,
+    ),
+    constraints=PortfolioConstraints(
+        dollar_neutral=True, max_weight=0.4,
+        vol_target=0.15,
+    ),
+    factor_names=["momentum_10", "volatility_30", "mean_reversion_60"],
+    signal_method="cross_sectional_zscore",
+    max_factor_lookback=60,
+)
+
+# 执行
+result = pipeline.run(price_panel, symbols=["BTC/USDT", "ETH/USDT", "SOL/USDT"])
+
+# 查看绩效
+print(result.summary())
+
+# 保存
+pipeline.save("ridge_momentum_v1")
+```
+
+**`run()` 的 8 个步骤：**
+
+```
+Step 1: 从 FactorStore 加载因子
+        ├── 按 factor_names 直接加载
+        └── 按 factor_families 族级筛选 → 自动选最优变体
+
+Step 2: 因子筛选（可选, 配置了 selection_params 时执行）
+
+Step 3: 因子对齐
+        align_factor_panels(factor_panels)
+
+Step 4: 构建特征矩阵 + 目标变量
+        X = build_feature_matrix(...)
+        y = compute_forward_returns_panel(...)
+
+Step 5: Walk-Forward 训练
+        TimeSeriesSplitter → WalkForwardEngine → predictions
+
+Step 6: 信号生成
+        generate_signal(predictions, method=...)
+
+Step 7: 组合构建
+        PortfolioConstructor(constraints).construct(signal, prices)
+
+Step 8: 向量化回测
+        vectorized_backtest(weights, prices)
+```
+
+**`save()` 方法：** 同时保存到 SignalStore（权重/信号/元数据/绩效）和 ModelStore（模型对象/重要性）。
+
+**支持两种因子指定方式的组合使用：**
+
+```python
+pipeline = AlphaPipeline(
+    model=Ridge(),
+    train_config=TrainConfig(),
+    constraints=PortfolioConstraints(),
+    factor_names=["my_custom_factor"],    # 直接指定
+    factor_families=["momentum"],          # 族级筛选
+    # 两者可组合使用，结果合并
+)
+```
+
+**阅读重点：**
+
+| 行范围 | 内容 | 学什么 |
+|--------|------|--------|
+| 53-88 | `__init__` | 参数设计、至少指定一个因子来源 |
+| 97-237 | `run` | 8 步管道编排、错误处理、日志记录 |
+| 239-279 | `save` | SignalStore + ModelStore 双重保存 |
+
+---
+
+## 十二、第 10 站：测试 tests/
+
+### 测试文件概览
+
+| 文件 | 测试对象 | 关键技巧 |
+|------|----------|----------|
+| `test_types.py` | Protocol 检查 + 配置验证 | `isinstance(model, AlphaModel)` 协议运行时检查 |
+| `test_preprocessing.py` | 对齐 + 标准化 + 特征矩阵 + 因子筛选 | `pd.testing.assert_frame_equal` 精确比较 |
+| `test_training.py` | 切分器 + Walk-Forward + Trainer | `_SimpleModel` 测试替身 |
+| `test_signal.py` | 信号生成 + EMA 平滑 | 统计性质验证（均值→0, 标准差→1） |
+| `test_portfolio.py` | beta + 协方差 + 约束 + 组合构建 + vol target | cvxpy 约束测试、infeasible 退化 |
+| `test_backtest.py` | 绩效指标 + 向量化回测 + 市场冲击 | 零权重→零收益、费率对比 |
+| `test_store.py` | SignalStore + ModelStore | `tmp_path` fixture、往返一致性 |
+| `test_models.py` | 参考模型封装 | `pytest.skip` 条件跳过、`tmp_path` 序列化往返 |
+| `test_pipeline.py` | AlphaPipeline 端到端 | `monkeypatch` 重定向存储路径 |
+
+### 核心测试模式
+
+**1. 测试替身（Test Double）**
+
+```python
+class _SimpleModel:
+    """简单均值模型用于测试"""
+    def fit(self, X, y, **kwargs):
+        self._mean = y.mean() if len(y) > 0 else 0.0
+    def predict(self, X):
+        return np.full(len(X), self._mean)
+```
+
+使用最简单的模型代替真实模型，隔离测试目标（Walk-Forward 引擎本身，而非模型效果）。
+
+**2. monkeypatch 重定向存储路径**
+
+```python
+@pytest.fixture
+def setup_stores(self, tmp_path, monkeypatch):
+    # 重定向 FactorStore 路径
+    monkeypatch.setattr(
+        "factor_research.config.FACTOR_STORE_DIR", str(factor_dir),
+    )
+    monkeypatch.setattr(
+        "factor_research.store.factor_store.FACTOR_STORE_DIR", str(factor_dir),
+    )
+    # 重定向 alpha_model 侧路径
+    monkeypatch.setattr(
+        "alpha_model.config.SIGNAL_STORE_DIR", tmp_path / "signals",
+    )
+    monkeypatch.setattr(
+        "alpha_model.config.MODEL_STORE_DIR", tmp_path / "models",
+    )
+```
+
+**关键点：** `monkeypatch.setattr` 必须同时 patch **定义处**和 **import 后的副本**两个位置，否则无参构造的类仍使用旧值。
+
+**3. 可选依赖的条件跳过**
+
+```python
+@pytest.fixture(autouse=True)
+def check_lgbm(self):
+    try:
+        import lightgbm
+    except ImportError:
+        pytest.skip("lightgbm 未安装")
+```
+
+**4. 不变量验证**
+
+```python
+# 训练集在测试集之前
+assert fold.train_end <= fold.test_start
+
+# embargo gap 足够大
+gap = fold.test_start - fold.train_end
+assert gap >= 30
+
+# dollar-neutral: 权重之和接近 0
+row_sums = weights.sum(axis=1).dropna()
+assert row_sums.abs().max() < 0.05
+
+# 仓位上限
+assert weights.abs().max().max() < 0.3 + 0.01
+```
+
+**运行测试：**
+
+```bash
+# 运行 Phase 2b 全部测试
+python -m pytest alpha_model/tests/ -v
+
+# 运行单个测试文件
+python -m pytest alpha_model/tests/test_training.py -v
+
+# 运行特定测试类
+python -m pytest alpha_model/tests/test_portfolio.py::TestPortfolioConstructor -v
+```
+
+---
+
+## 十三、核心概念深入
+
+### 13.1 Walk-Forward 验证 vs 传统交叉验证
+
+**传统 k-fold 交叉验证的问题：**
+
+```
+传统 k-fold:
+Fold 1: [TEST] [TRAIN] [TRAIN] [TRAIN] [TRAIN]
+Fold 2: [TRAIN] [TEST] [TRAIN] [TRAIN] [TRAIN]
+Fold 3: [TRAIN] [TRAIN] [TEST] [TRAIN] [TRAIN]
+```
+
+在金融时序中，这会导致**用未来数据训练模型来预测过去**，严重违反因果关系。
+
+**Walk-Forward 验证：**
+
+```
+Walk-Forward:
+Fold 0: [===TRAIN===]--embargo--[=TEST=]
+Fold 1: [=========TRAIN=========]--embargo--[=TEST=]
+Fold 2: [===============TRAIN===============]--embargo--[=TEST=]
+```
+
+核心保证：
+1. **时序顺序**：训练集永远在测试集之前
+2. **Embargo 隔离**：训练集和测试集之间有间隔，防止标签泄漏
+3. **样本外预测**：每个数据点只在样本外被预测一次
+
+### 13.2 为什么用 cvxpy 凸优化而不是顺序规则
+
+**顺序规则的问题：**
+
+```python
+# 顺序规则方法（有缺陷）
+weights = signal / signal.abs().sum()       # Step 1: 归一化
+weights = weights.clip(-0.4, 0.4)           # Step 2: 截断
+weights = weights - weights.mean()          # Step 3: dollar-neutral 调整
+# 但 Step 3 之后可能破坏 Step 2 的仓位上限约束！
+```
+
+**cvxpy 凸优化的优势：**
+
+所有约束**同时满足**，不存在顺序冲突。优化器在可行域内找到**全局最优解**（二次凸问题保证全局最优），同时考虑风险最小化、收益最大化和换手率控制。
+
+### 13.3 Ledoit-Wolf Shrinkage 直觉
+
+想象你估计了一个 5x5 的协方差矩阵。样本协方差矩阵 S 有 15 个自由参数（上三角），但可能只有几百个样本。估计误差很大。
+
+Ledoit-Wolf 的做法是把 S 向一个简单的"目标矩阵" F 收缩：
+- F = 对角矩阵（只保留方差，去掉所有相关性）
+- 收缩后：Σ = δF + (1-δ)S
+
+δ 越大，越信任结构化假设（"资产之间不相关"）；δ 越小，越信任样本数据。δ 的最优值由数据自动决定。
+
+**直觉**：如果样本太少（T/N 小），δ 会较大（更多收缩）；如果样本充足，δ 会较小（更信任数据）。
+
+### 13.4 Square-root 市场冲击模型
+
+```
+impact = coeff × σ × √(trade_value / ADV)
+```
+
+三个因素的直觉：
+- **σ（波动率）**：高波动率的资产，订单簿更薄，冲击更大
+- **trade_value / ADV（参与率）**：交易金额占日均成交量的比例越大，冲击越大
+- **√（平方根）**：冲击随参与率增长但速率递减——第一个百分点的冲击最大
+
+这是 Almgren-Chriss 模型的简化版，是量化行业最常用的市场冲击估计方法。
+
+### 13.5 Vol Targeting 机制
+
+**问题**：不同时期的市场波动率差异巨大（2020年3月 vs 2021年平静期），固定权重导致策略的波动率不可控。
+
+**解决方案**：动态调整杠杆
+
+```
+realized_vol = portfolio.rolling(60).std() × √525960  (年化)
+scale = target_vol / realized_vol
+adjusted_weights = weights × scale
+```
+
+```
+高波动率时期：scale < 1 → 减仓
+低波动率时期：scale > 1 → 加仓
+
+效果：策略的波动率更稳定，夏普比率通常更高
+```
+
+受 `leverage_cap` 约束：即使波动率很低，也不能无限放大杠杆。
+
+### 13.6 无前瞻偏差的执行
+
+Phase 2b 在多个层面防止前瞻偏差：
+
+```
+1. 时序切分（splitter.py）:
+   embargo_periods = max(target_horizon, max_factor_lookback)
+   训练集和测试集之间有隔离期
+
+2. 标准化工具箱（transform.py）:
+   expanding_zscore: 只看当前及之前
+   rolling_zscore: 只看窗口内的过去数据
+   cross_sectional: 每个时刻独立计算
+
+3. 协方差估计（constructor.py）:
+   returns_before = returns_panel.loc[:ts].iloc[:-1]
+   严格只用当前时刻之前的数据（不含当前行）
+
+4. Vol Targeting（risk_budget.py）:
+   shifted_weights = weights.shift(1)
+   用滞后一期的权重计算组合收益率
+
+5. 回测 P&L（vectorized.py）:
+   shifted_w = w.shift(1)
+   用 t-1 时刻的权重乘 t 时刻的收益
+```
+
+---
+
+## 十四、设计模式总结
+
+| 模式 | 应用位置 | 解决的问题 |
+|------|----------|------------|
+| **Protocol（协议）** | `AlphaModel` | 模型零耦合——sklearn/PyTorch/手写均可接入 |
+| **dataclass + `__post_init__`** | `TrainConfig`, `PortfolioConstraints`, `ModelMeta` | 配置集中管理 + 构造时校验 |
+| **工厂模式** | `ModelStore.load(model_factory=...)` | 解耦模型创建和模型加载 |
+| **深拷贝隔离** | `copy.deepcopy(model)` in Walk-Forward | 每个 fold 的模型独立，避免状态污染 |
+| **原子写入** | SignalStore, ModelStore | `.tmp` + `os.rename`，防止写入中断损坏数据 |
+| **凸优化建模** | `PortfolioConstructor` | 所有约束同时满足，cvxpy 联合求解 |
+| **工具箱模式** | `transform.py` 的标准化函数 | 标准化不硬编码在管道中，用户自由选择 |
+| **可选依赖** | `tree_models.py`, `torch_base.py` | `import lightgbm` 在方法内部，未安装不影响其他模块 |
+| **Facade（门面）** | `AlphaPipeline`, `Trainer` | 一站式接口，内部编排多模块协作 |
+
+---
+
+## 十五、数据流全景图
+
+```
+                          Phase 2b 数据流
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│  FactorStore.load()          DataReader.get_ohlcv()                 │
+│       │                              │                              │
+│       ▼                              ▼                              │
+│  因子面板 dict                    价格面板                          │
+│  {name: (ts × sym)}            (ts × sym)                          │
+│       │                              │                              │
+│  ┌────▼────────┐                     │                              │
+│  │ selection   │ (可选)              │                              │
+│  │ threshold   │                     │                              │
+│  │ / top_k     │                     │                              │
+│  └────┬────────┘                     │                              │
+│       │                              │                              │
+│  ┌────▼────────┐                     │                              │
+│  │ alignment   │                     │                              │
+│  │ 多频率对齐  │                     │                              │
+│  └────┬────────┘                     │                              │
+│       │                              │                              │
+│  ┌────▼────────────────┐    ┌────────▼───────────┐                 │
+│  │ build_feature_matrix │    │ forward_returns    │                 │
+│  │ → X (特征矩阵)      │    │ → y (目标变量)     │                 │
+│  └────┬────────────────┘    └────────┬───────────┘                 │
+│       │                              │                              │
+│  ┌────▼──────────────────────────────▼───────────┐                 │
+│  │            Walk-Forward Engine                 │                 │
+│  │  splitter.split() → folds                     │                 │
+│  │  for fold in folds:                           │                 │
+│  │    model = deepcopy(model)                    │                 │
+│  │    model.fit(X_train, y_train)                │                 │
+│  │    preds = model.predict(X_test)              │                 │
+│  └────┬──────────────────────────────────────────┘                 │
+│       │                                                             │
+│       ▼ predictions (ts × sym)                                     │
+│  ┌────────────────┐                                                 │
+│  │ generate_signal │ → signal (ts × sym)                           │
+│  │ 截面 z-score    │                                                │
+│  └────┬───────────┘                                                 │
+│       │                                                             │
+│  ┌────▼──────────────────────────────────────────┐                 │
+│  │         PortfolioConstructor                   │                 │
+│  │  for ts in signal.index:                      │                 │
+│  │    cov = estimate_covariance(returns[:ts])     │                 │
+│  │    w = cvxpy.solve(                           │                 │
+│  │      min w'Σw - λα'w + γ||w-w_prev||₁        │                 │
+│  │      s.t. constraints                         │                 │
+│  │    )                                          │                 │
+│  │  apply_vol_target(weights, ...)               │                 │
+│  └────┬──────────────────────────────────────────┘                 │
+│       │                                                             │
+│       ▼ weights (ts × sym)                                         │
+│  ┌────────────────────┐                                             │
+│  │ vectorized_backtest │ → BacktestResult                          │
+│  │ P&L + 手续费       │   (equity, returns, turnover, summary)    │
+│  │ + 市场冲击         │                                            │
+│  └────┬───────────────┘                                             │
+│       │                                                             │
+│  ┌────▼────────┐  ┌────────────┐                                   │
+│  │ SignalStore  │  │ ModelStore  │                                   │
+│  │ → Phase 3   │  │ → 实盘推理  │                                   │
+│  └─────────────┘  └────────────┘                                   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 十六、延伸练习
+
+### 练习 1：手写一个满足 AlphaModel 协议的模型
+
+```python
+# 目标: 实现一个简单的动量因子均值模型
+# 要求: 实现 fit/predict + save_model/load_model
+
+class MomentumMeanModel:
+    def fit(self, X, y, **kwargs):
+        # 记住每个因子的均值系数
+        # 提示: 使用 np.linalg.lstsq
+        ...
+
+    def predict(self, X):
+        ...
+
+    def save_model(self, path):
+        # 提示: np.save
+        ...
+
+    def load_model(self, path):
+        ...
+
+# 验证: isinstance(MomentumMeanModel(), AlphaModel) 应为 True
+```
+
+### 练习 2：对比 Expanding vs Rolling Walk-Forward
+
+```python
+# 目标: 对同一数据集，分别用 Expanding 和 Rolling 模式训练
+# 对比两者的 IC、Sharpe ratio 差异
+
+from alpha_model.training.trainer import Trainer
+from alpha_model.core.types import TrainConfig, WalkForwardMode
+
+config_exp = TrainConfig(wf_mode=WalkForwardMode.EXPANDING, ...)
+config_rol = TrainConfig(wf_mode=WalkForwardMode.ROLLING, ...)
+
+result_exp = Trainer(model, config_exp).run(...)
+result_rol = Trainer(model, config_rol).run(...)
+
+# 对比每个 fold 的 IC
+```
+
+### 练习 3：实验不同 risk_aversion 对权重分配的影响
+
+```python
+# 目标: 固定信号，改变 λ (risk_aversion)，观察权重变化
+# λ=0: 纯 alpha 最大化（忽略风险）
+# λ=1: 均衡风险和收益
+# λ=10: 极度风险厌恶
+
+for lam in [0, 0.1, 1.0, 10.0]:
+    constraints = PortfolioConstraints(risk_aversion=lam, ...)
+    constructor = PortfolioConstructor(constraints)
+    weights = constructor.construct(signal, prices)
+    print(f"λ={lam}: avg |w|={weights.abs().mean().mean():.4f}")
+```
+
+### 练习 4：添加一个新的绩效指标
+
+```python
+# 目标: 在 performance.py 中添加 Information Ratio
+# Information Ratio = mean(excess_return) / std(excess_return)
+# 其中 excess_return = strategy_return - benchmark_return
+
+def information_ratio(returns, benchmark_returns, periods_per_year):
+    ...
+
+# 然后在 BacktestResult.summary() 中添加此指标
+```
+
+### 练习 5：端到端 Pipeline 实验
+
+```python
+# 目标: 使用 AlphaPipeline 完成从因子到回测的完整流程
+# 1. 选择 3-5 个因子
+# 2. 使用 Ridge + Expanding Walk-Forward
+# 3. Dollar-neutral + vol_target=0.15
+# 4. 分析 summary() 中各指标的含义
+# 5. 尝试换 LightGBM 模型，对比 Ridge 的结果
+
+pipeline = AlphaPipeline(
+    model=Ridge(alpha=1.0),
+    train_config=TrainConfig(
+        train_periods=3000, test_periods=1000,
+        target_horizon=10, purge_periods=60,
+    ),
+    constraints=PortfolioConstraints(
+        dollar_neutral=True, vol_target=0.15,
+    ),
+    factor_names=["..."],  # 填入你在 Phase 2a 中研究的因子
+)
+result = pipeline.run(price_panel)
+print(result.summary())
+```
+
+---
+
+**Phase 2b 学习完成后，你应该具备：**
+1. 理解 Protocol 模式如何实现模型零耦合
+2. 理解 Walk-Forward 验证防止过拟合的原理
+3. 理解 cvxpy 凸优化如何同时满足多个组合约束
+4. 理解从因子到目标权重的完整数据流
+5. 能够独立构建和评估一个量化交易策略
+6. 理解交易成本（手续费 + 市场冲击）对策略绩效的影响
+7. 具备进入 Phase 3（实盘交易系统）的知识基础
 
 **祝学习顺利！**

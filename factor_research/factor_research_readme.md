@@ -468,8 +468,8 @@ corr = hy_correlation_matrix({"BTC": btc_prices, "ETH": eth_prices})
 | `cumulative_returns(returns)` | `evaluation.metrics` | 累计收益曲线 |
 | `annualize_return(returns, periods_per_year)` | `evaluation.metrics` | 年化收益率 |
 | `annualize_volatility(returns, periods_per_year)` | `evaluation.metrics` | 年化波动率 |
-| `sharpe_ratio(returns, periods_per_year, risk_free_rate)` | `evaluation.metrics` | 夏普比率 |
-| `max_drawdown(cumulative)` | `evaluation.metrics` | 最大回撤 |
+| `sharpe_ratio(returns, periods_per_year, risk_free_rate)` | `evaluation.metrics` | 夏普比率（零波动率返回 ±inf） |
+| `max_drawdown(cumulative)` | `evaluation.metrics` | 最大回撤（返回负数，如 -0.15 表示 15% 回撤） |
 
 #### 因子存储
 

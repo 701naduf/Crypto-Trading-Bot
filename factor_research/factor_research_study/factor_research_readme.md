@@ -1188,7 +1188,7 @@ print(loaded_meta.factor_type)  # FactorType.TIME_SERIES
 | 172-195 | `rank_normalize()` | rank(pct=True) 的含义 |
 | 197-220 | `cross_sectional_rank()` | rank(axis=1) 截面排名 |
 | 250-280 | `mutual_information()` | sklearn 互信息 + 离散化处理 |
-| 282-330 | `cumulative_returns()`, `sharpe_ratio()`, `max_drawdown()` | 组合绩效指标 |
+| 282-330 | `cumulative_returns()`, `sharpe_ratio()`, `max_drawdown()` | 组合绩效指标（注意: max_drawdown 返回负数，sharpe_ratio 零波动率返回 ±inf） |
 
 ### 动手练习
 

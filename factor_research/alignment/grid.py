@@ -30,7 +30,7 @@ def grid_align(
     start: pd.Timestamp = None,
     end: pd.Timestamp = None,
     fill_method: str = "ffill",
-    max_gap: int = None,
+    max_gap: "int | pd.Timedelta" = None,
 ) -> pd.DataFrame:
     """
     将多个不规则时间序列对齐到规则网格
@@ -42,8 +42,12 @@ def grid_align(
         start:       网格起始时间，默认取所有序列的最早时间
         end:         网格结束时间，默认取所有序列的最晚时间
         fill_method: 填充方法，"ffill" (默认) 或 "bfill"
-        max_gap:     最大填充间隔（网格点数），超过此间隔的填充变为 NaN。
+        max_gap:     最大填充间隔，超过此间隔的填充值变为 NaN。
                      防止长时间没有更新的标的用过时数据填充。
+                     支持两种类型:
+                     - int: 网格点数（如 max_gap=3 表示超过 3 个网格点）
+                     - pd.Timedelta: 时间间隔（如 pd.Timedelta("5s") 表示超过 5 秒）
+                       会自动根据网格频率转换为网格点数。
                      None 表示不限制。
 
     Returns:
@@ -64,13 +68,20 @@ def grid_align(
         ...     index=pd.to_datetime(["2024-01-01 10:00:00.300",
         ...                           "2024-01-01 10:00:00.900"])
         ... )
-        >>> panel = grid_align(
-        ...     {"BTC/USDT": btc_factor, "ETH/USDT": eth_factor},
-        ...     freq="1s"
-        ... )
+        >>> # 使用网格点数
+        >>> panel = grid_align({"BTC/USDT": btc_factor}, freq="1s", max_gap=3)
+        >>> # 使用时间间隔
+        >>> panel = grid_align({"BTC/USDT": btc_factor}, freq="1s", max_gap=pd.Timedelta("5s"))
     """
     if not series_dict:
         return pd.DataFrame()
+
+    # 将 timedelta 类型的 max_gap 转换为网格点数
+    if isinstance(max_gap, pd.Timedelta):
+        grid_step = pd.tseries.frequencies.to_offset(freq)
+        # to_offset 返回的是 DateOffset，转为 Timedelta 进行除法
+        grid_step_td = pd.Timedelta(grid_step.nanos, unit="ns")
+        max_gap = int(max_gap / grid_step_td)
 
     # 确定网格范围
     if start is None:

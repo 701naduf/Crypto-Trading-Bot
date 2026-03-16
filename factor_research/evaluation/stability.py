@@ -158,9 +158,10 @@ def _ic_max_drawdown(ic_ts: pd.Series) -> float:
 
     将 IC 序列视为"收益"，计算其累计曲线的最大回撤。
     衡量 IC 最差的连续时期有多严重。
+    返回非正数，与 max_drawdown() 保持一致的行业惯例。
 
     Returns:
-        float: IC 最大回撤（正数）
+        float: IC 最大回撤（非正数，如 -0.5 表示 IC 累计曲线从峰值下跌 0.5）
     """
     valid = ic_ts.dropna()
     if len(valid) < 2:
@@ -169,10 +170,6 @@ def _ic_max_drawdown(ic_ts: pd.Series) -> float:
     # 用 IC 的累计和来模拟"IC 曲线"
     cum_ic = valid.cumsum()
     running_max = cum_ic.cummax()
-    drawdown = running_max - cum_ic
+    drawdown = cum_ic - running_max  # 非正数序列
 
-    if running_max.max() == 0:
-        return 0.0
-
-    # 归一化回撤
-    return float(drawdown.max())
+    return float(drawdown.min())
