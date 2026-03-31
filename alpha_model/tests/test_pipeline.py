@@ -77,11 +77,18 @@ class TestAlphaPipeline:
             factor_names.append(name)
 
         # 3. patch alpha_model 侧的存储路径
+        # 必须同时 patch config 模块和 store 模块的局部绑定（与 FactorStore 同理）[R1-ext]
         monkeypatch.setattr(
             "alpha_model.config.SIGNAL_STORE_DIR", tmp_path / "signals",
         )
         monkeypatch.setattr(
+            "alpha_model.store.signal_store.SIGNAL_STORE_DIR", tmp_path / "signals",
+        )
+        monkeypatch.setattr(
             "alpha_model.config.MODEL_STORE_DIR", tmp_path / "models",
+        )
+        monkeypatch.setattr(
+            "alpha_model.store.model_store.MODEL_STORE_DIR", tmp_path / "models",
         )
 
         return factor_names, price_panel, symbols

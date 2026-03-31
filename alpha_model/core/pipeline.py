@@ -266,6 +266,7 @@ class AlphaPipeline:
             strategy_name=strategy_name,
             weights=self._weights,
             signals=self._signal,
+            raw_predictions=self._wf_result.predictions,   # Walk-Forward OOS 原始预测
             meta=meta,
             performance=self._bt_result.summary(),
         )

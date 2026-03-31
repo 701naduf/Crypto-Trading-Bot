@@ -18,8 +18,13 @@ from alpha_model.core.types import (
     TrainConfig,
     PortfolioConstraints,
 )
+from sklearn.linear_model import Ridge
+from alpha_model.core.pipeline import AlphaPipeline
+from alpha_model.config import DEFAULT_SYMBOLS
 from alpha_model.store.signal_store import SignalStore
 from alpha_model.store.model_store import ModelStore
+from factor_research.store.factor_store import FactorStore
+from factor_research.core.types import FactorMeta, FactorType
 
 
 class _DummyModel:
@@ -61,6 +66,10 @@ def _make_weights(n=50) -> pd.DataFrame:
         {"BTC/USDT": np.random.randn(n) * 0.1, "ETH/USDT": np.random.randn(n) * 0.1},
         index=idx,
     )
+
+
+# T1–T4 用到的 helper，与 _make_weights 等价（保持语义清晰）
+make_dummy_panel = _make_weights
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +149,133 @@ class TestSignalStore:
         """加载不存在的策略应报错"""
         with pytest.raises(FileNotFoundError):
             store.load_weights("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# TestRawPredictions（T1–T4）
+# ---------------------------------------------------------------------------
+
+class TestRawPredictions:
+    """SignalStore raw_predictions 新功能测试（T1–T4）"""
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        return SignalStore(base_dir=tmp_path / "signals")
+
+    def test_save_load_raw_predictions_roundtrip(self, store):
+        """T1: save() 传入 raw_predictions → load_raw_predictions() 可正确还原"""
+        raw = make_dummy_panel()
+        store.save("s1", weights=make_dummy_panel(), raw_predictions=raw)
+        loaded = store.load_raw_predictions("s1")
+        pd.testing.assert_frame_equal(loaded, raw, check_freq=False)
+
+    def test_has_raw_predictions(self, store):
+        """T2: 不传 raw_predictions 时为 False；传入后为 True"""
+        store.save("no_raw", weights=make_dummy_panel())
+        assert store.has_raw_predictions("no_raw") is False
+
+        store.save("with_raw", weights=make_dummy_panel(),
+                   raw_predictions=make_dummy_panel())
+        assert store.has_raw_predictions("with_raw") is True
+
+    def test_has_signals(self, store):
+        """T3: 不传 signals 时为 False；传入后为 True"""
+        store.save("no_sig", weights=make_dummy_panel())
+        assert store.has_signals("no_sig") is False
+
+        store.save("with_sig", weights=make_dummy_panel(),
+                   signals=make_dummy_panel())
+        assert store.has_signals("with_sig") is True
+
+    def test_load_raw_predictions_missing_raises(self, store):
+        """T4: 未存储 raw_predictions 时，load_raw_predictions 应抛出 FileNotFoundError"""
+        store.save("s1", weights=make_dummy_panel())
+        with pytest.raises(FileNotFoundError, match="原始预测文件不存在"):
+            store.load_raw_predictions("s1")
+
+
+# ---------------------------------------------------------------------------
+# T5：端到端 pipeline raw_predictions 存储测试
+# ---------------------------------------------------------------------------
+
+def test_pipeline_save_includes_raw_predictions(tmp_path, monkeypatch):
+    """
+    T5: 端到端——pipeline.run() + pipeline.save() 之后，
+    SignalStore 中应存在 raw_predictions，
+    且 shape 与 WalkForwardResult.predictions 一致。
+    """
+    symbols = ["BTC/USDT", "ETH/USDT"]
+    n = 500
+    rng = np.random.RandomState(0)
+    idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+
+    # 构建合成价格面板
+    returns = rng.randn(n, len(symbols)) * 0.001
+    price_panel = pd.DataFrame(
+        100 * np.exp(np.cumsum(returns, axis=0)),
+        index=idx, columns=symbols,
+    )
+
+    # 构建合成因子并写入临时 FactorStore
+    factor_dir = tmp_path / "factors"
+    monkeypatch.setattr("factor_research.config.FACTOR_STORE_DIR", str(factor_dir))
+    monkeypatch.setattr(
+        "factor_research.store.factor_store.FACTOR_STORE_DIR", str(factor_dir)
+    )
+    factor_store = FactorStore()
+    factor_names = []
+    for i in range(3):
+        name = f"t5_factor_{i}"
+        panel = pd.DataFrame(
+            rng.randn(n, len(symbols)) * 0.01,
+            index=idx, columns=symbols,
+        )
+        meta = FactorMeta(
+            name=name, display_name=name,
+            factor_type=FactorType.TIME_SERIES, category="test",
+            description="t5 test factor",
+            data_requirements=[],
+            output_freq="1min",
+        )
+        factor_store.save(name, panel, meta)
+        factor_names.append(name)
+
+    # patch alpha_model 存储路径
+    # 必须同时 patch config 模块和 store 模块的局部绑定（与 FactorStore 同理）[R1]
+    monkeypatch.setattr("alpha_model.config.SIGNAL_STORE_DIR", tmp_path / "signals")
+    monkeypatch.setattr("alpha_model.store.signal_store.SIGNAL_STORE_DIR", tmp_path / "signals")
+    monkeypatch.setattr("alpha_model.config.MODEL_STORE_DIR", tmp_path / "models")
+    monkeypatch.setattr("alpha_model.store.model_store.MODEL_STORE_DIR", tmp_path / "models")
+
+    # 构建并运行 pipeline
+    pipeline = AlphaPipeline(
+        model=Ridge(alpha=1.0),
+        train_config=TrainConfig(
+            train_periods=100, test_periods=50,
+            target_horizon=5, purge_periods=10,
+        ),
+        constraints=PortfolioConstraints(vol_target=None),
+        factor_names=factor_names,
+    )
+    pipeline.run(price_panel, symbols=symbols)
+    pipeline.save("test_strategy")
+
+    # 验证 raw_predictions 已存入 SignalStore
+    # 使用无参构造（已 patch SIGNAL_STORE_DIR），与 pipeline.save() 写入路径一致
+    store = SignalStore()
+    assert store.has_raw_predictions("test_strategy"), "raw_predictions 应已存储"
+
+    raw = store.load_raw_predictions("test_strategy")
+    assert isinstance(raw, pd.DataFrame)
+    assert set(raw.columns) == set(symbols)
+    assert len(raw) > 0
+
+    # 验证与 pipeline 内部 predictions 一致
+    # check_names=False：_load_parquet 将 index.name 设为 None（既有行为），
+    # 而 predictions.index.name 为 'timestamp'，两者数值完全一致
+    pd.testing.assert_frame_equal(
+        raw, pipeline._wf_result.predictions, check_freq=False, check_names=False
+    )
 
 
 # ---------------------------------------------------------------------------

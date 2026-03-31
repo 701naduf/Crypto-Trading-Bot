@@ -1,16 +1,30 @@
 """
 策略输出持久化
 
-存储策略的目标权重、原始信号、元数据和绩效摘要。
-这是 Phase 2b → Phase 3 的唯一输出接口。
+存储策略的目标权重、标准化信号、模型原始预测、元数据和绩效摘要。
+这是 Phase 2b → Phase 3 / Phase 4 / execution_optimizer 的唯一持久化接口。
 
-路径: db/signals/{strategy_name}/
-    ├── weights.parquet        # 目标权重面板 (timestamp × symbol)
-    ├── signals.parquet        # 原始信号面板（权重之前，用于调试）
-    ├── meta.json              # ModelMeta 序列化
-    └── performance.json       # BacktestResult.summary() 结果
+存储路径: db/signals/{strategy_name}/
+    ├── weights.parquet          # 目标权重面板 (timestamp × symbol)，必须
+    ├── signals.parquet          # 标准化信号面板 (post-generator, pre-cvxpy)，可选
+    ├── raw_predictions.parquet  # 模型原始预测面板 (post-predict, pre-generator)，可选
+    ├── meta.json                # ModelMeta 序列化
+    └── performance.json         # BacktestResult.summary() 结果
 
-写入策略: 原子写入（先写 .tmp 再 rename），与 FactorStore 一致。
+写入策略: 原子写入（先写 .tmp 目录，全部完成后 rename），与 FactorStore 一致。
+
+数据层定义:
+    raw_predictions: model.predict() 的 OOS 原始输出，未经任何后处理
+    signals:         经 SignalGenerator 标准化（z-score / rank 等）的截面信号
+    weights:         经 PortfolioConstructor (cvxpy + γ) 优化后的目标权重
+
+消费方与适用数据层:
+    Phase 3 向量化回测       → weights（主要路径）
+    Phase 3 事件驱动回测     → weights 或 execution_optimizer 输出权重
+    execution_optimizer      → signals 或 raw_predictions（多资产 / 单资产场景）
+    单资产择时策略           → raw_predictions（直接按得分阈值触发，无需组合优化）
+    Phase 4 实盘执行         → execution_optimizer 输出权重
+    模型监控 / 审计          → raw_predictions + signals（诊断用）
 """
 
 from __future__ import annotations
@@ -48,18 +62,25 @@ class SignalStore:
         strategy_name: str,
         weights: pd.DataFrame,
         signals: pd.DataFrame | None = None,
+        raw_predictions: pd.DataFrame | None = None,
         meta: ModelMeta | None = None,
         performance: dict | None = None,
     ) -> None:
         """
         保存策略输出（原子写入）
 
+        修改前后行为对比：
+            修改前：save(name, weights, signals, meta, performance)  → 存 3 层
+            修改后：save(name, weights, signals, raw_predictions, meta, performance) → 存 4 层
+            不传 raw_predictions 时，行为与修改前完全一致
+
         Args:
-            strategy_name: 策略名称
-            weights:       目标权重面板 (timestamp × symbol)
-            signals:       原始信号面板（可选）
-            meta:          策略元数据（可选）
-            performance:   绩效摘要字典（可选）
+            strategy_name:    策略名称（对应 db/signals/{strategy_name}/）
+            weights:          目标权重面板 (timestamp × symbol)，必须提供
+            signals:          标准化信号面板 (post-generator, pre-cvxpy)，可选
+            raw_predictions:  模型原始预测面板 (post-predict, pre-generator)，可选
+            meta:             策略元数据，可选
+            performance:      绩效摘要字典，可选
         """
         final_dir = self._strategy_dir(strategy_name)
         tmp_dir = final_dir.with_suffix(".tmp")
@@ -77,6 +98,10 @@ class SignalStore:
             # 保存信号（可选）
             if signals is not None:
                 self._save_parquet(signals, tmp_dir / "signals.parquet")
+
+            # 保存模型原始预测（可选）
+            if raw_predictions is not None:
+                self._save_parquet(raw_predictions, tmp_dir / "raw_predictions.parquet")
 
             # 保存元数据（可选）
             if meta is not None:
@@ -120,10 +145,35 @@ class SignalStore:
         return self._load_parquet(path)
 
     def load_signals(self, strategy_name: str) -> pd.DataFrame:
-        """加载原始信号面板"""
+        """加载标准化信号面板 (post-generator, pre-cvxpy)"""
         path = self._strategy_dir(strategy_name) / "signals.parquet"
         if not path.exists():
             raise FileNotFoundError(f"策略 '{strategy_name}' 的信号文件不存在")
+        return self._load_parquet(path)
+
+    def load_raw_predictions(self, strategy_name: str) -> pd.DataFrame:
+        """
+        加载模型原始预测面板 (post-predict, pre-generator)
+
+        与 load_signals() 的区别：
+            load_signals()         → 标准化后的截面信号，适合组合优化输入
+            load_raw_predictions() → 模型原始得分，适合单资产择时 / 模型诊断
+
+        Args:
+            strategy_name: 策略名称
+
+        Returns:
+            DataFrame，index=DatetimeIndex(UTC)，columns=symbols
+
+        Raises:
+            FileNotFoundError: 若保存时未传入 raw_predictions 参数
+        """
+        path = self._strategy_dir(strategy_name) / "raw_predictions.parquet"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"策略 '{strategy_name}' 的原始预测文件不存在。"
+                f"请确认 AlphaPipeline.save() 时已正确传入 raw_predictions 参数。"
+            )
         return self._load_parquet(path)
 
     def load_meta(self, strategy_name: str) -> ModelMeta:
@@ -155,6 +205,22 @@ class SignalStore:
     def exists(self, strategy_name: str) -> bool:
         """检查策略是否存在"""
         return self._strategy_dir(strategy_name).exists()
+
+    def has_signals(self, strategy_name: str) -> bool:
+        """
+        检查该策略是否存储了标准化信号文件。
+
+        save() 中不传 signals 参数时，此方法返回 False。
+        """
+        return (self._strategy_dir(strategy_name) / "signals.parquet").exists()
+
+    def has_raw_predictions(self, strategy_name: str) -> bool:
+        """
+        检查该策略是否存储了模型原始预测文件。
+
+        save() 中不传 raw_predictions 参数时，此方法返回 False。
+        """
+        return (self._strategy_dir(strategy_name) / "raw_predictions.parquet").exists()
 
     def delete(self, strategy_name: str) -> None:
         """删除策略数据"""
