@@ -2933,7 +2933,7 @@ alpha_model/                     # Phase 2b 模型策略
 │   └── performance.py           # 绩效指标 + BacktestResult
 │
 ├── store/                       # 持久化
-│   ├── signal_store.py          # 信号/权重/元数据存储
+│   ├── signal_store.py          # 信号/权重/原始预测/元数据存储
 │   └── model_store.py           # 模型对象持久化
 │
 ├── models/                      # 参考模型实现（示例，非核心架构）
@@ -2967,11 +2967,11 @@ pipeline.py → training/ + signal/ + portfolio/ + backtest/ + store/
 **与其他阶段的接口：**
 
 ```
-Phase 2a (因子研究)           Phase 2b (模型策略)           Phase 3 (实盘)
+Phase 2a (因子研究)           Phase 2b (模型策略)           下游消费方
 FactorStore.load()  ──→  preprocessing/  ──→  ...  ──→  SignalStore  ──→  ...
-                         (alignment,                    (weights.parquet)
-                          transform,
-                          selection)
+                         (alignment,                    ├── weights.parquet          → Phase 3 向量化回测
+                          transform,                    ├── signals.parquet          → execution_optimizer
+                          selection)                    └── raw_predictions.parquet  → 单资产择时 / 诊断
 ```
 
 ---
@@ -3401,11 +3401,14 @@ for fold in folds:
 ```python
 @dataclass
 class WalkForwardResult:
-    predictions: pd.DataFrame         # 样本外预测面板 (timestamp × symbol)
-    fold_metrics: list[dict]          # 每个 fold 的 IC 等评估指标
-    feature_importance: pd.DataFrame  # 因子重要性（各 fold 平均）
+    predictions: pd.DataFrame              # 样本外预测面板 (timestamp × symbol)
+    fold_metrics: list[dict]               # 每个 fold 的 IC 等评估指标
+    feature_importance: pd.DataFrame       # 因子重要性（模型原生，各 fold 平均）
+    permutation_importance: pd.DataFrame   # 置换重要性（模型无关，按需计算）
     train_config: TrainConfig | None
 ```
+
+`permutation_importance` 使用 `field(default_factory=lambda: pd.DataFrame())`，不传时为空 DataFrame，保证向后兼容。
 
 2. **Pooled 模式的流程**
 
@@ -3439,6 +3442,60 @@ for fold in folds:
 - Pooled 模式：按 timestamp 分组计算截面 IC，取均值
 - Per-Symbol 模式：直接计算 Spearman IC
 
+5. **Permutation Importance（置换重要性）**
+
+模型无关的特征重要性估计方法。原理：依次打乱单个特征列 → 用训练好的模型重新预测 → 测量 IC 下降幅度。IC 下降越多，说明该特征贡献越大。
+
+```python
+# 开启置换重要性
+engine = WalkForwardEngine(
+    model, splitter, train_mode=TrainMode.POOLED,
+    compute_permutation_importance=True,   # 默认 False，不计算
+    n_permutations=5,                      # 每特征打乱 5 次取均值
+    permutation_random_state=42,           # 可复现（None=不固定）
+)
+result = engine.run(X, y, symbols)
+
+# 查看结果
+print(result.permutation_importance)
+#   feature         mean_importance
+#   momentum_10     0.032           ← IC 下降了 0.032，贡献大
+#   noise_feature   -0.001          ← IC 不下降，无贡献
+```
+
+**与 `feature_importance` 的区别：**
+
+| 维度 | `feature_importance` | `permutation_importance` |
+|------|---------------------|--------------------------|
+| 来源 | `model.get_feature_importance()`（模型内部） | 打乱特征后 IC 下降量（模型外部） |
+| 依赖模型类型 | 是（树模型=split gain，线性模型=|coef|） | 否（任何模型均适用） |
+| 计算成本 | 极低（直接读取模型属性） | 较高（O(n_features × n_permutations) 次 predict） |
+| 可选 | 模型实现了 `get_feature_importance()` 时自动收集 | 需显式开启 `compute_permutation_importance=True` |
+
+**实现细节（`_compute_permutation_importance` 静态方法）：**
+
+```python
+# 伪代码
+def _compute_permutation_importance(model, X_test, y_test, n_perm, rng):
+    # 1. 基准 IC
+    base_ic = spearman_ic(model.predict(X_test), y_test)
+    if isnan(base_ic): return {}   # 模型无预测力时跳过
+
+    # 2. 逐特征打乱
+    for feature in X_test.columns:
+        ic_drops = []
+        for _ in range(n_perm):
+            X_shuffled = X_test.copy()
+            X_shuffled[feature] = rng.permutation(X_shuffled[feature].values)
+            shuffled_ic = spearman_ic(model.predict(X_shuffled), y_test)
+            ic_drops.append(base_ic - shuffled_ic)
+        importance[feature] = mean(ic_drops)
+
+    return importance   # 正值=有贡献，零/负值=无贡献
+```
+
+注意：使用 `np.random.RandomState`（而非 `np.random.default_rng`）以兼容较旧的 numpy 版本。
+
 **阅读重点：**
 
 | 行范围 | 内容 | 学什么 |
@@ -3447,6 +3504,7 @@ for fold in folds:
 | 219-310 | `_run_per_symbol` | 每个 symbol 独立 Walk-Forward |
 | 312-349 | `_compute_fold_ic` | 截面 IC 均值计算 |
 | 351-379 | `_get_importance` / `_average_importance` | 安全获取 + 多 fold 平均 |
+| 381-420 | `_compute_permutation_importance` | 置换重要性：打乱 → 预测 → IC 下降 |
 
 ### 5.3 `alpha_model/training/trainer.py` — 训练调度器
 
@@ -3890,43 +3948,77 @@ total_return         — 总收益率
 
 **核心知识点：**
 
-SignalStore 是 Phase 2b → Phase 3 的**唯一输出接口**。
+SignalStore 是 Phase 2b → Phase 3 / Phase 4 / execution_optimizer 的**唯一持久化接口**。
 
-存储结构：
+存储结构（三层数据 + 两层元数据）：
 ```
 db/signals/{strategy_name}/
-├── weights.parquet        # 目标权重面板
-├── signals.parquet        # 原始信号面板（调试用）
-├── meta.json              # ModelMeta 序列化
-└── performance.json       # BacktestResult.summary()
+├── weights.parquet          # 目标权重面板 (post-cvxpy)           [必须]
+├── signals.parquet          # 标准化信号面板 (post-generator)      [可选]
+├── raw_predictions.parquet  # 模型原始预测面板 (post-predict)      [可选]
+├── meta.json                # ModelMeta 序列化
+└── performance.json         # BacktestResult.summary()
 ```
+
+**三层数据的区别与适用场景：**
+
+```
+数据流方向:
+model.predict() → raw_predictions → SignalGenerator → signals → PortfolioConstructor → weights
+    (最原始)           (标准化后)         (优化后)
+```
+
+| 数据层 | 生成阶段 | 消费方 | 适用场景 |
+|--------|----------|--------|---------|
+| `raw_predictions` | model.predict() 的 OOS 原始输出 | execution_optimizer、单资产择时 | 模型诊断、无需组合优化的场景 |
+| `signals` | 经 SignalGenerator 截面标准化后 | execution_optimizer（多资产） | 动态成本优化器的输入信号 |
+| `weights` | 经 PortfolioConstructor (cvxpy + γ) 优化后 | Phase 3 向量化回测 | 已融入换手惩罚的最终权重 |
+
+**为什么需要 raw_predictions？**
+
+`weights` 已经融入了换手惩罚 γ，如果作为 execution_optimizer 的输入，γ 和动态成本会被双重计算。`signals` 经过截面标准化，适合多资产优化但丢失了原始分数量级。`raw_predictions` 是最纯净的模型输出，适合单资产阈值触发、模型监控等场景。
 
 1. **原子写入**（与 Phase 1 一致）：先写 `.tmp` 目录，完成后 `os.rename` 原子替换，防止写入中断导致数据损坏。
 
 2. **Parquet 格式**：带 `timestamp` 列，保持与 FactorStore 风格一致。
+
+3. **存在性检查方法**：`has_signals()` 和 `has_raw_predictions()` 检查可选文件是否存在，防止下游盲目调用 `load_raw_predictions()` 时因文件不存在而崩溃。
 
 ```python
 from alpha_model.store.signal_store import SignalStore
 
 store = SignalStore()
 
-# 保存
+# 保存（raw_predictions 由 AlphaPipeline.save() 自动传入）
 store.save(
     strategy_name="ridge_momentum_v1",
     weights=weights_df,
     signals=signal_df,
+    raw_predictions=raw_preds_df,       # 可选，不传时行为与旧版完全一致
     meta=model_meta,
     performance=backtest_result.summary(),
 )
 
 # 加载
 weights = store.load_weights("ridge_momentum_v1")
+signals = store.load_signals("ridge_momentum_v1")
+raw = store.load_raw_predictions("ridge_momentum_v1")  # FileNotFoundError if not saved
 meta = store.load_meta("ridge_momentum_v1")
 perf = store.load_performance("ridge_momentum_v1")
+
+# 存在性检查（推荐在 load 前调用）
+if store.has_raw_predictions("ridge_momentum_v1"):
+    raw = store.load_raw_predictions("ridge_momentum_v1")
+if store.has_signals("ridge_momentum_v1"):
+    signals = store.load_signals("ridge_momentum_v1")
 
 # 列出所有策略
 print(store.list_strategies())
 ```
+
+**`save()` 的向后兼容设计：**
+
+`raw_predictions` 参数插入在 `signals` 和 `meta` 之间，默认值为 `None`。不传时，存储目录中不会生成 `raw_predictions.parquet`，`has_raw_predictions()` 返回 `False`。所有旧代码无需修改。
 
 ### 9.2 `alpha_model/store/model_store.py` — 模型持久化
 
@@ -3967,8 +4059,10 @@ importance = store.load_importance("ridge_v1")
 
 | 文件 | 行范围 | 内容 | 学什么 |
 |------|--------|------|--------|
-| signal_store.py | 46-107 | `save` | 原子写入: `.tmp` 目录 → `os.rename` |
-| signal_store.py | 160-175 | `_save_parquet` / `_load_parquet` | Parquet 格式约定 |
+| signal_store.py | 46-113 | `save` | 原子写入: `.tmp` 目录 → `os.rename`、raw_predictions 可选写入 |
+| signal_store.py | 129-152 | `load_raw_predictions` | 带用户友好错误信息的 FileNotFoundError |
+| signal_store.py | 159-173 | `has_signals` / `has_raw_predictions` | 存在性检查（防御性编程模式） |
+| signal_store.py | 182-197 | `_save_parquet` / `_load_parquet` | Parquet 格式约定 |
 | model_store.py | 49-110 | `save` | `hasattr(model, "save_model")` 安全检查 |
 | model_store.py | 112-150 | `load` | `model_factory()` 工厂模式 |
 
@@ -4133,7 +4227,9 @@ Step 8: 向量化回测
         vectorized_backtest(weights, prices)
 ```
 
-**`save()` 方法：** 同时保存到 SignalStore（权重/信号/元数据/绩效）和 ModelStore（模型对象/重要性）。
+**`save()` 方法：** 同时保存到 SignalStore（权重/信号/原始预测/元数据/绩效）和 ModelStore（模型对象/重要性）。
+
+`save()` 自动将 `self._wf_result.predictions`（Walk-Forward OOS 原始预测）作为 `raw_predictions` 传入 `signal_store.save()`，无需用户手动指定。这保证了只要运行过 pipeline，原始预测一定会被持久化，供下游 execution_optimizer 或单资产择时策略读取。
 
 **支持两种因子指定方式的组合使用：**
 
@@ -4166,13 +4262,13 @@ pipeline = AlphaPipeline(
 |------|----------|----------|
 | `test_types.py` | Protocol 检查 + 配置验证 | `isinstance(model, AlphaModel)` 协议运行时检查 |
 | `test_preprocessing.py` | 对齐 + 标准化 + 特征矩阵 + 因子筛选 | `pd.testing.assert_frame_equal` 精确比较 |
-| `test_training.py` | 切分器 + Walk-Forward + Trainer | `_SimpleModel` 测试替身 |
+| `test_training.py` | 切分器 + Walk-Forward + Permutation Importance + Trainer | `_SimpleModel` 测试替身、Ridge 真实模型验证信号vs噪声 |
 | `test_signal.py` | 信号生成 + EMA 平滑 | 统计性质验证（均值→0, 标准差→1） |
 | `test_portfolio.py` | beta + 协方差 + 约束 + 组合构建 + vol target | cvxpy 约束测试、infeasible 退化 |
 | `test_backtest.py` | 绩效指标 + 向量化回测 + 市场冲击 | 零权重→零收益、费率对比 |
-| `test_store.py` | SignalStore + ModelStore | `tmp_path` fixture、往返一致性 |
+| `test_store.py` | SignalStore + ModelStore + raw_predictions 端到端 | `tmp_path` fixture、往返一致性、monkeypatch 双重 patch |
 | `test_models.py` | 参考模型封装 | `pytest.skip` 条件跳过、`tmp_path` 序列化往返 |
-| `test_pipeline.py` | AlphaPipeline 端到端 | `monkeypatch` 重定向存储路径 |
+| `test_pipeline.py` | AlphaPipeline 端到端 | `monkeypatch` 重定向存储路径（含 store 模块局部绑定） |
 
 ### 核心测试模式
 
@@ -4195,22 +4291,29 @@ class _SimpleModel:
 @pytest.fixture
 def setup_stores(self, tmp_path, monkeypatch):
     # 重定向 FactorStore 路径
+    # 必须同时 patch config 模块（定义处）和 store 模块（import 后的副本）
     monkeypatch.setattr(
         "factor_research.config.FACTOR_STORE_DIR", str(factor_dir),
     )
     monkeypatch.setattr(
         "factor_research.store.factor_store.FACTOR_STORE_DIR", str(factor_dir),
     )
-    # 重定向 alpha_model 侧路径
+    # 重定向 alpha_model 侧路径（同理，必须双重 patch）
     monkeypatch.setattr(
         "alpha_model.config.SIGNAL_STORE_DIR", tmp_path / "signals",
     )
     monkeypatch.setattr(
+        "alpha_model.store.signal_store.SIGNAL_STORE_DIR", tmp_path / "signals",
+    )
+    monkeypatch.setattr(
         "alpha_model.config.MODEL_STORE_DIR", tmp_path / "models",
+    )
+    monkeypatch.setattr(
+        "alpha_model.store.model_store.MODEL_STORE_DIR", tmp_path / "models",
     )
 ```
 
-**关键点：** `monkeypatch.setattr` 必须同时 patch **定义处**和 **import 后的副本**两个位置，否则无参构造的类仍使用旧值。
+**关键点：** `monkeypatch.setattr` 必须同时 patch **定义处**（`config` 模块）和 **import 后的副本**（`store` 模块的顶层绑定）两个位置。Python 的 `from X import Y` 会在 import 时创建局部名称绑定，之后修改 `X.Y` 不会影响已经绑定的局部变量。这是 Python 测试中最常见的 monkeypatch 陷阱之一。
 
 **3. 可选依赖的条件跳过**
 
@@ -4559,6 +4662,237 @@ pipeline = AlphaPipeline(
 )
 result = pipeline.run(price_panel)
 print(result.summary())
+
+
+# Phase 2c 执行优化器 — 代码学习指引
+
+本节是 `execution_optimizer/` 模块的代码学习指引。
+建议阅读顺序：config.py → cost.py → optimizer.py。
+
+## 目录
+
+- [一、模块整体结构](#一模块整体结构-2c)
+- [二、建议学习路线](#二建议学习路线-2c)
+- [三、第 1 站：配置与数据类 config.py](#三第-1-站配置与数据类-configpy)
+- [四、第 2 站：成本表达式 cost.py](#四第-2-站成本表达式-costpy)
+- [五、第 3 站：单步优化器 optimizer.py](#五第-3-站单步优化器-optimizerpy)
+- [六、核心知识点](#六核心知识点)
+- [七、与 Phase 2b 的对比](#七与-phase-2b-的对比)
+
+---
+
+## 一、模块整体结构 {#一模块整体结构-2c}
+
+```
+execution_optimizer/
+├── __init__.py              # 公开导出 ExecutionOptimizer, MarketContext
+├── config.py                # MarketContext 数据类 + 默认常量
+├── cost.py                  # 动态成本表达式（cvxpy 符号表达式）
+├── optimizer.py             # ExecutionOptimizer.optimize_step()
+└── tests/
+    ├── test_cost.py         # T1-T3: 成本函数测试
+    └── test_optimizer.py    # T4-T10: 优化器测试
+```
+
+**依赖关系**（只允许向下/向左依赖）：
+
+```
+alpha_model.core.types (PortfolioConstraints)
+alpha_model.portfolio.constraints (build_constraints)
+alpha_model.portfolio.covariance (estimate_covariance)
+alpha_model.portfolio.beta (rolling_beta)
+        │
+        ▼
+execution_optimizer.config (MarketContext)
+        │
+        ▼
+execution_optimizer.cost (build_cost_expression)
+        │
+        ▼
+execution_optimizer.optimizer (ExecutionOptimizer)
+```
+
+---
+
+## 二、建议学习路线 {#二建议学习路线-2c}
+
+```
+config.py           理解 MarketContext 各字段的含义
+   │                （spread, volatility, adv, funding_rate）
+   ▼
+cost.py             理解三分量成本模型
+   │                重点: 收益率空间建模、DCP 合规
+   ▼
+optimizer.py        理解完整目标函数和约束
+   │                重点: 与 Phase 2b PortfolioConstructor 的差异
+   ▼
+test_cost.py        通过手工计算比对理解成本公式
+   │
+   ▼
+test_optimizer.py   通过测试理解各约束和 fallback 行为
+```
+
+---
+
+## 三、第 1 站：配置与数据类 config.py
+
+**核心知识点**: `@dataclass` 作为类型安全的数据容器
+
+```python
+# MarketContext 是每个时间步注入的市场快照
+# 调用方（Phase 3/4 的事件循环）负责构造并传入
+
+from execution_optimizer.config import MarketContext
+import pandas as pd
+
+symbols = ["BTC/USDT", "ETH/USDT"]
+
+context = MarketContext(
+    timestamp=pd.Timestamp("2026-01-01 00:00"),
+    symbols=symbols,
+    spread=pd.Series([0.0002, 0.0004], index=symbols),      # bid-ask spread
+    volatility=pd.Series([0.02, 0.03], index=symbols),       # 近期波动率
+    adv=pd.Series([1_000_000.0, 500_000.0], index=symbols),  # 日均成交量 (USDT)
+    portfolio_value=10_000.0,                                 # 组合总资金
+    funding_rate=pd.Series([0.0001, -0.0001], index=symbols), # 可选: 资金费率
+)
+```
+
+**重点行**: config.py:15-50 — MarketContext 的每个字段都有详细 docstring。
+
+---
+
+## 四、第 2 站：成本表达式 cost.py
+
+**核心知识点**: 收益率空间无量纲化、DCP 合规
+
+```python
+# cost.py 返回的是 cvxpy 表达式（符号），不是数值
+# 它被嵌入到优化器的目标函数中，由求解器自动微分和求解
+
+# 三个分量:
+# ① commission = fee_rate × Σ|Δw_i|                    ← 线性
+# ② spread     = Σ(spread_i/2 × |Δw_i|)               ← 线性
+# ③ impact     = Σ(eff_coeff_i × |Δw_i|^1.5)           ← 超线性
+
+# 为什么用收益率空间（Δw）而非金额空间（ΔV）？
+# 因为目标函数的其他项（w'Σw, α'w）都在收益率空间。
+# 如果成本用金额，需要额外的 V 缩放因子，容易出错。
+# 收益率空间让所有项天然同量纲。
+
+# 为什么 |Δw|^1.5 而不是 |Δw|^0.5？
+# 金额空间: impact ∝ σ × (ΔV/ADV)^0.5
+# 收益率空间: Δw = ΔV/V, 代入得 impact/V ∝ σ × √(V/ADV) × |Δw|^0.5
+# 但这是对 V 的占比! 乘回 |Δw| 得到收益率空间的等价:
+# impact_return = eff_coeff × |Δw|^1.5
+# 详见 cost.py 头部的量纲推导注释。
+```
+
+**DCP 合规**:
+- `cp.norm1(delta_w)` — L1 范数，凸，DCP OK
+- `cp.power(cp.abs(delta_w), 1.5)` — 凸幂函数，DCP OK
+- 整体: 凸函数之和仍为凸 → SOCP 可解
+
+**重点行**: cost.py:20-55 — 量纲推导。cost.py:60-100 — 三分量构建。
+
+---
+
+## 五、第 3 站：单步优化器 optimizer.py
+
+**核心知识点**: 完整目标函数、约束复用、fallback 设计
+
+```python
+# 目标函数四项:
+# ① w'Σw                          — 风险（最小化）
+# ② -λ × α'w                      — 收益（最大化，取负变为最小化）
+# ③ cost(Δw, MarketContext)        — 交易成本（最小化）
+# ④ funding_rate'w                 — 资金费率（多头正费率 = 成本）
+
+# 对比 Phase 2b PortfolioConstructor:
+# Phase 2b: w'Σw - λ×α'w + γ×‖Δw‖₁        ← γ 是固定超参数
+# Phase 2c: w'Σw - λ×α'w + cost(Δw, ctx)   ← cost 是动态的，依赖实时市场状态
+```
+
+**约束复用** (optimizer.py:146-156):
+
+```python
+# 直接调用 Phase 2b 的约束构建器，零代码重复!
+from alpha_model.portfolio.constraints import build_constraints
+cvx_constraints = build_constraints(w, self.constraints, beta=beta_vec)
+
+# 额外添加 ADV 参与率约束（Phase 2b 没有）
+# |Δw_i| × V ≤ participation × ADV_i
+# 等价于: |Δw_i| ≤ participation × ADV_i / V
+```
+
+**三条 Fallback 路径** (optimizer.py:116-176):
+
+```python
+# 1. 协方差估计失败（数据不足） → return current_weights
+# 2. cvxpy 求解抛异常            → return current_weights
+# 3. 求解状态非最优（INFEASIBLE）  → return current_weights
+# 设计哲学: 宁可不交易，不可异常崩溃
+```
+
+**Vol Targeting 单步实现** (optimizer.py:183-193):
+
+```python
+# Phase 2b 的 apply_vol_target 需要历史组合收益序列（面板级函数）
+# Phase 2c 是单步调用，没有历史序列
+# 解法: 用协方差矩阵直接计算 port_vol = √(w'Σw × MINUTES_PER_YEAR)
+# 然后 scale = vol_target / port_vol
+# 缩放后还要检查 leverage_cap（可能放大后超杠杆）
+```
+
+---
+
+## 六、核心知识点
+
+### 6.1 收益率空间 vs 金额空间
+
+在组合优化中，有两种建模方式:
+
+| 维度 | 收益率空间 | 金额空间 |
+|------|-----------|---------|
+| 变量 | w (权重, 无量纲) | V (金额, USDT) |
+| 风险 | w'Σw (方差) | V'Σ_dollar'V |
+| 成本 | 无量纲（收益率占比） | 有量纲（USDT） |
+| 优势 | 各项天然同量纲 | 更直观 |
+
+本项目选择收益率空间，与学术文献和 Phase 2b 保持一致。
+
+### 6.2 DCP (Disciplined Convex Programming)
+
+cvxpy 不是通用求解器，它要求问题满足 DCP 规则:
+- 目标: 最小化凸函数 / 最大化凹函数
+- 约束: 凸 ≤ 常数, 仿射 == 常数
+
+`|Δw|^1.5` 是凸的（p > 1 时 |x|^p 是凸的），所以 DCP 通过。
+如果用了 `|Δw|^0.5`（凹的），cvxpy 会报错。
+
+### 6.3 SOCP (Second-Order Cone Programming)
+
+标准 Mean-Variance（w'Σw + 线性项）是 QP（二次规划），用 OSQP 求解。
+加入 `|Δw|^1.5` 后，问题升级为 SOCP（二阶锥规划），需要 ECOS 或 MOSEK。
+cvxpy 自动选择合适的求解器，无需手动指定。
+
+---
+
+## 七、与 Phase 2b 的对比
+
+| 维度 | Phase 2b PortfolioConstructor | Phase 2c ExecutionOptimizer |
+|------|------------------------------|---------------------------|
+| 使用场景 | 向量化回测（批处理全部时间步） | 事件驱动（每步调用一次） |
+| 成本模型 | 固定 γ‖Δw‖₁ | 动态 cost(Δw, MarketContext) |
+| ADV 约束 | 无 | |Δw_i| × V ≤ participation × ADV_i |
+| 资金费率 | 不考虑 | 纳入目标函数 |
+| Vol Targeting | apply_vol_target (面板级) | 协方差矩阵直接估计 (单步) |
+| 输出 | 整个回测期的权重面板 | 单个时间步的目标权重 |
+| 互斥关系 | 两者互斥，不可同时启用 | 两者互斥，不可同时启用 |
+
+**什么时候用哪个？**
+- 因子研究/策略回测/快速验证 → Phase 2b（快，向量化）
+- 事件驱动回测/模拟盘/实盘 → Phase 2c（精确，动态成本）
 ```
 
 ---

@@ -110,14 +110,14 @@ Crypto-Trading-Bot/
 │   │   ├── vectorized.py       #     向量化 P&L（手续费 + 市场冲击）
 │   │   └── performance.py      #     绩效指标汇总（BacktestResult）
 │   ├── store/                  #   持久化
-│   │   ├── signal_store.py     #     策略输出存储（权重 + 信号 + 元数据 + 绩效）
+│   │   ├── signal_store.py     #     策略输出存储（权重 + 信号 + 原始预测 + 元数据 + 绩效）
 │   │   └── model_store.py      #     模型存储（模型文件 + 元数据 + 因子重要性）
 │   ├── models/                 #   参考模型实现（示例，非核心架构）
 │   │   ├── linear_models.py    #     SklearnModelWrapper（Ridge/Lasso/ElasticNet）
 │   │   ├── tree_models.py      #     LGBMModelWrapper / XGBModelWrapper
 │   │   └── torch_base.py       #     TorchModelBase（PyTorch 基础封装）
 │   ├── utils.py                #   辅助工具（load_price_panel 等）
-│   └── tests/                  #   单元测试（157 项）
+│   └── tests/                  #   单元测试（166 项）
 │       ├── test_types.py
 │       ├── test_preprocessing.py
 │       ├── test_training.py
@@ -127,6 +127,15 @@ Crypto-Trading-Bot/
 │       ├── test_store.py
 │       ├── test_models.py
 │       └── test_pipeline.py
+│
+├── execution_optimizer/        # 第二阶段(c)：执行优化器
+│   ├── __init__.py             #   公开导出 ExecutionOptimizer, MarketContext
+│   ├── config.py               #   MarketContext 数据类 + 默认常量
+│   ├── cost.py                 #   动态成本表达式（commission + spread + 1.5次幂 impact）
+│   ├── optimizer.py            #   ExecutionOptimizer.optimize_step() 单步优化
+│   └── tests/                  #   单元测试（31 项）
+│       ├── test_cost.py        #     T1-T3: 成本函数数值/单调/零值
+│       └── test_optimizer.py   #     T4-T10: 可解性/成本压制/ADV/资金费率/VolTarget/Fallback/Beta
 │
 ├── db/                         # 共享数据存储（各模块通过此目录通信）
 │   ├── factors/                #   因子存储目录（FactorStore 的数据根）
@@ -889,9 +898,22 @@ from alpha_model.training.walk_forward import WalkForwardEngine
 engine = WalkForwardEngine(model, splitter, train_mode=TrainMode.POOLED)
 result = engine.run(X, y, symbols)
 
-# result.predictions:        样本外预测面板 (timestamp × symbol)
-# result.fold_metrics:       每个 fold 的 IC 等指标
-# result.feature_importance: 因子重要性（各 fold 平均）
+# result.predictions:             样本外预测面板 (timestamp × symbol)
+# result.fold_metrics:            每个 fold 的 IC 等指标
+# result.feature_importance:      因子重要性（模型原生，各 fold 平均）
+# result.permutation_importance:  置换重要性（模型无关，按需开启）
+
+# 开启 Permutation Importance（模型无关的因子重要性）
+engine = WalkForwardEngine(
+    model, splitter, train_mode=TrainMode.POOLED,
+    compute_permutation_importance=True,   # 开启
+    n_permutations=5,                      # 每个特征打乱 5 次
+    permutation_random_state=42,           # 可复现
+)
+result = engine.run(X, y, symbols)
+# result.permutation_importance → DataFrame(feature, mean_importance)
+# 原理: 打乱单列 → IC 下降幅度 = 该特征的贡献度
+# 复杂度: O(n_features × n_permutations × n_folds) 次 predict
 ```
 
 #### 训练调度器 (trainer)
@@ -1019,27 +1041,44 @@ print(result.summary())
 
 #### SignalStore — 策略输出存储
 
-Phase 2b → Phase 3 的唯一输出接口。原子写入（先 `.tmp` 再 `rename`）。
+Phase 2b → Phase 3 / Phase 4 / execution_optimizer 的唯一持久化接口。原子写入（先 `.tmp` 再 `rename`）。
+
+三层数据：
+- **weights** (post-cvxpy)：目标权重，主要供向量化回测消费
+- **signals** (post-generator, pre-cvxpy)：标准化信号，供 execution_optimizer 多资产优化
+- **raw_predictions** (post-predict, pre-generator)：模型原始预测，供单资产择时/模型诊断
 
 ```
 db/signals/{strategy_name}/
-├── weights.parquet        # 目标权重面板
-├── signals.parquet        # 原始信号面板（调试用）
-├── meta.json              # ModelMeta 序列化
-└── performance.json       # 绩效摘要
+├── weights.parquet          # 目标权重面板（必须）
+├── signals.parquet          # 标准化信号面板（可选）
+├── raw_predictions.parquet  # 模型原始预测面板（可选）
+├── meta.json                # ModelMeta 序列化
+└── performance.json         # 绩效摘要
 ```
 
 ```python
 from alpha_model.store.signal_store import SignalStore
 
 store = SignalStore()
-store.save("strategy_v1", weights, signals=signal, meta=meta, performance=result.summary())
+
+# 保存（raw_predictions 由 AlphaPipeline.save() 自动传入）
+store.save("strategy_v1", weights, signals=signal,
+           raw_predictions=raw_preds, meta=meta, performance=result.summary())
+
+# 加载
 store.load_weights("strategy_v1")
 store.load_signals("strategy_v1")
+store.load_raw_predictions("strategy_v1")  # 模型原始预测
 store.load_meta("strategy_v1")
 store.load_performance("strategy_v1")
+
+# 存在性检查
+store.has_signals("strategy_v1")            # signals.parquet 是否存在
+store.has_raw_predictions("strategy_v1")    # raw_predictions.parquet 是否存在
+store.exists("strategy_v1")                 # 策略目录是否存在
+
 store.list_strategies()
-store.exists("strategy_v1")
 store.delete("strategy_v1")
 ```
 
@@ -1259,8 +1298,9 @@ pipeline.save("ridge_momentum_v1")
 │  │  data.reader.DataReader     ──► utils.load_price_panel │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                                                             │
-│  ┌─ Phase 3（下游，尚未实现）───────────────────────────┐   │
-│  │  仅通过 SignalStore.load_weights() 读取策略权重       │   │
+│  ┌─ Phase 3 / Phase 4 / execution_optimizer（下游）────┐   │
+│  │  通过 SignalStore 读取 weights / signals /           │   │
+│  │    raw_predictions（按场景选择数据层）                │   │
 │  │  不直接依赖 alpha_model 的任何其他模块                 │   │
 │  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
@@ -1290,7 +1330,7 @@ pipeline.save("ridge_momentum_v1")
 | `TimeSeriesSplitter(train_periods, test_periods, target_horizon, max_factor_lookback, mode)` | `training.splitter` | 时序切分器 |
 | `TimeSeriesSplitter.split(n_samples)` | `training.splitter` | 生成 Fold 列表 |
 | `Fold.train_start/train_end/test_start/test_end` | `training.splitter` | 切分索引（含/不含） |
-| `WalkForwardEngine(model, splitter, train_mode)` | `training.walk_forward` | Walk-Forward 引擎 |
+| `WalkForwardEngine(model, splitter, train_mode, compute_permutation_importance, n_permutations, permutation_random_state)` | `training.walk_forward` | Walk-Forward 引擎（后三个参数可选，控制置换重要性） |
 | `WalkForwardEngine.run(X, y, symbols)` | `training.walk_forward` | 执行 Walk-Forward，返回 WalkForwardResult |
 | `Trainer(model, train_config, max_factor_lookback)` | `training.trainer` | 训练调度器 |
 | `Trainer.run(factor_panels, price_panel, symbols)` | `training.trainer` | 一站式训练（特征构建+目标变量+WF） |
@@ -1330,11 +1370,14 @@ pipeline.save("ridge_momentum_v1")
 | 函数/方法 | 模块 | 说明 |
 |-----------|------|------|
 | `SignalStore(base_dir)` | `store.signal_store` | 策略输出存储，默认 `db/signals/` |
-| `.save(strategy_name, weights, signals, meta, performance)` | `store.signal_store` | 原子写入 |
+| `.save(strategy_name, weights, signals, raw_predictions, meta, performance)` | `store.signal_store` | 原子写入（signals、raw_predictions 均可选） |
 | `.load_weights(strategy_name)` | `store.signal_store` | 加载权重面板 |
-| `.load_signals(strategy_name)` | `store.signal_store` | 加载信号面板 |
+| `.load_signals(strategy_name)` | `store.signal_store` | 加载标准化信号面板 |
+| `.load_raw_predictions(strategy_name)` | `store.signal_store` | 加载模型原始预测面板 |
 | `.load_meta(strategy_name)` | `store.signal_store` | 加载策略元数据 |
 | `.load_performance(strategy_name)` | `store.signal_store` | 加载绩效摘要 |
+| `.has_signals(strategy_name)` | `store.signal_store` | 检查是否存储了信号文件 |
+| `.has_raw_predictions(strategy_name)` | `store.signal_store` | 检查是否存储了原始预测文件 |
 | `.list_strategies()` | `store.signal_store` | 列出所有策略 |
 | `ModelStore(base_dir)` | `store.model_store` | 模型存储，默认 `db/models/` |
 | `.save(model_name, model, meta, importance)` | `store.model_store` | 保存模型 + 元数据 |
@@ -1373,6 +1416,54 @@ MINUTES_PER_YEAR = 525_960              # 1m K线: 365.25 × 24 × 60
 
 ---
 
+## 第二阶段(c)：执行优化器 (execution_optimizer)
+
+### 概述
+
+Phase 2b `PortfolioConstructor` 使用固定换手惩罚 γ‖Δw‖₁，适用于向量化回测。
+Phase 2c `ExecutionOptimizer` 是其事件驱动替代方案，使用动态成本模型，
+为事件驱动回测和实盘交易提供单步组合优化。两者互斥使用。
+
+### 核心设计
+
+**目标函数**（全部收益率空间，无量纲）：
+
+```
+minimize:  w'Σw - λ × α'w + cost(Δw, MarketContext) + funding_rate'w
+```
+
+**动态成本模型（3 分量）**：
+
+| 分量 | 公式 | 说明 |
+|------|------|------|
+| 佣金 | `fee_rate × Σ\|Δw_i\|` | 线性，Binance taker 0.04% |
+| 买卖价差 | `Σ(spread_i/2 × \|Δw_i\|)` | 线性，实时注入 |
+| 市场冲击 | `Σ(eff_coeff_i × \|Δw_i\|^1.5)` | 超线性，SOCP 合规 |
+
+**约束**：复用 Phase 2b 约束构建器 + ADV 参与率约束。
+
+### 使用方式
+
+```python
+from execution_optimizer import ExecutionOptimizer, MarketContext
+from alpha_model.core.types import PortfolioConstraints
+
+constraints = PortfolioConstraints(max_weight=0.4, dollar_neutral=True)
+optimizer = ExecutionOptimizer(constraints)
+
+# 事件循环中每步调用
+target_w = optimizer.optimize_step(signals_t, current_w, context, prices[:t])
+```
+
+### Phase 2c 测试覆盖
+
+| 测试文件 | 测试项数 | 覆盖内容 |
+|---------|---------|---------|
+| test_cost.py | 9 | T1-T3: 成本分量数值正确性（手工比对）、成本单调性、零交易零成本、逐标的冲击系数 |
+| test_optimizer.py | 22 | T4-T10: 基本可解性（无NaN/约束满足）、高成本压制交易、ADV参与率约束、资金费率影响、Vol Targeting（缩放+leverage二次检查）、Fallback路径（协方差失败/求解异常/状态非最优）、Beta-neutral路径 |
+
+---
+
 ## 运行测试
 
 ```bash
@@ -1382,11 +1473,14 @@ python -m pytest data_infra/tests/ -v
 # 第二阶段(a) 测试（198 项）
 python -m pytest factor_research/tests/ -v
 
-# 第二阶段(b) 测试（157 项）
+# 第二阶段(b) 测试（166 项）
 python -m pytest alpha_model/tests/ -v
 
+# 第二阶段(c) 测试（31 项）
+python -m pytest execution_optimizer/tests/ -v
+
 # 全部测试
-python -m pytest data_infra/tests/ factor_research/tests/ alpha_model/tests/ -v  # 预期 480 项全通过
+python -m pytest data_infra/tests/ factor_research/tests/ alpha_model/tests/ execution_optimizer/tests/ -v  # 预期 646 项全通过
 ```
 
 ### Phase 2b 测试覆盖
@@ -1395,11 +1489,11 @@ python -m pytest data_infra/tests/ factor_research/tests/ alpha_model/tests/ -v 
 |---------|---------|---------|
 | test_types.py | 23 | AlphaModel Protocol、TrainConfig/PortfolioConstraints 校验、ModelMeta 序列化/反序列化 |
 | test_preprocessing.py | 36 | 因子对齐（自动推断/手动指定/边界）、标准化工具箱（expanding/rolling/截面/去极值）、特征矩阵构建（Pooled/Per-Symbol）、因子筛选 |
-| test_training.py | 16 | 时序切分器（Expanding/Rolling/Embargo）、Walk-Forward（Pooled/Per-Symbol）、Trainer 一站式训练 |
+| test_training.py | 20 | 时序切分器（Expanding/Rolling/Embargo）、Walk-Forward（Pooled/Per-Symbol）、Permutation Importance（开关/信号vs噪声/Per-Symbol）、Trainer 一站式训练 |
 | test_signal.py | 12 | 信号生成（z-score/rank/clip）、EMA 平滑、空数据/零方差边界 |
 | test_portfolio.py | 22 | 凸优化组合构建、约束生成（dollar/beta-neutral/杠杆）、协方差估计（Ledoit-Wolf/样本/指数）、滚动 Beta、波动率目标 |
 | test_backtest.py | 13 | 向量化回测、交易成本模型、绩效指标（Sharpe/Sortino/Calmar/回撤持续期）、BacktestResult.summary() |
-| test_store.py | 16 | SignalStore CRUD/原子写入/列表/删除、ModelStore CRUD/工厂加载/因子重要性 |
+| test_store.py | 21 | SignalStore CRUD/原子写入/列表/删除、raw_predictions 存取往返/has_signals/has_raw_predictions/缺失报错、Pipeline 端到端 raw_predictions 存储、ModelStore CRUD/工厂加载/因子重要性 |
 | test_models.py | 17 | SklearnModelWrapper/LGBMModelWrapper/XGBModelWrapper/TorchModelBase 的 fit/predict/save/load/importance |
 | test_pipeline.py | 2 | AlphaPipeline 端到端运行、save 持久化 |
 
@@ -1448,6 +1542,15 @@ python -m pytest data_infra/tests/ factor_research/tests/ alpha_model/tests/ -v 
 - **两层交易成本模型**：固定手续费 + Square-root 市场冲击（Almgren-Chriss 简化版），对流动性差的标的更真实
 - **SignalStore 作为唯一下游接口**：alpha_model 与 Phase 3（执行引擎）仅通过 SignalStore 的权重面板通信
 - **models/ 是示例代码，不是核心架构**：用户完全可以不用任何封装类，只要实现 `fit/predict` 即可接入
+
+### 第二阶段(c)
+- **动态成本模型替代固定惩罚**：3 分量（commission + spread + 1.5 次幂 impact）替代 Phase 2b 的固定 γ‖Δw‖₁
+- **收益率空间建模**：全部量在收益率空间表达，与目标函数其他项量纲一致
+- **1.5 次幂 impact 保持 SOCP 合规**：cvxpy DCP 验证通过，ECOS 自动求解
+- **资金费率纳入目标函数**：永续合约持仓成本/收益不可忽略
+- **ADV 参与率约束**：`|Δw_i| × V ≤ participation × ADV_i`，防止单步冲击市场
+- **约束零重复**：直接复用 `alpha_model.portfolio.constraints.build_constraints`
+- **三路 Fallback**：协方差失败/求解异常/状态非最优 → 返回 current_weights，宁可不交易不可崩溃
 
 ## 交易对
 
