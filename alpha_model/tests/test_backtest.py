@@ -227,3 +227,100 @@ class TestMarketImpact:
         gross_sum = result_no_adv.gross_returns.sum()
         net_sum = result_no_adv.returns.sum()
         assert abs((gross_sum - net_sum) - result_no_adv.total_cost) < 1e-10
+
+
+# ---------------------------------------------------------------------------
+# 跨模块端到端一致性护栏：vectorized_backtest 全链路 impact 计算
+# 必须与 execution_optimizer.cost.build_cost_expression 在同输入下一致
+# ---------------------------------------------------------------------------
+
+class TestImpactEndToEndConsistency:
+    """
+    端到端护栏：从 vectorized_backtest 入口出发计算 impact cost，
+    与 cost.py 在同输入下的 impact 分量精确相等。
+
+    这层护栏比 test_cost.py 的 TestImpactFormulaConsistency 更严格——
+    它覆盖了 vectorized_backtest 内部 σ 尺度、ADV 对齐、delta_w.shift 等
+    调用细节，能抓到"公式对但传入参数尺度错"这类 bug（历史上 σ 年化 vs
+    日化就是这类，commit 3.5 修复）。
+    """
+
+    def test_vectorized_impact_matches_cost_py_single_trade(self):
+        """
+        精确数值比对：构造"仅在某一个 bar 发生一次调仓"的场景，
+        断言该 bar 的 vectorized impact cost == cost.py 的 impact 值。
+        """
+        from execution_optimizer.config import MarketContext
+        from execution_optimizer.cost import build_cost_expression
+        import cvxpy as cp
+
+        symbols = ["BTC/USDT", "ETH/USDT"]
+        n = 120
+        idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+        rng = np.random.RandomState(7)
+
+        rets = rng.randn(n, len(symbols)) * 0.001
+        prices = 100 * np.exp(np.cumsum(rets, axis=0))
+        price_panel = pd.DataFrame(prices, index=idx, columns=symbols)
+
+        # weights: 前 79 行全 0；第 80 行开始 [0.1, -0.05]
+        # 这样 delta_w 仅在第 80 行非零，其他行 impact=0
+        trade_bar = 80
+        w = np.zeros((n, len(symbols)))
+        w[trade_bar:, 0] = 0.1
+        w[trade_bar:, 1] = -0.05
+        weights = pd.DataFrame(w, index=idx, columns=symbols)
+
+        adv_value = 1_000_000.0
+        adv_panel = pd.DataFrame(adv_value, index=idx, columns=symbols)
+        V = 10_000.0
+        impact_coeff = 0.1
+
+        # --- 路径 1: vectorized_backtest ---
+        result = vectorized_backtest(
+            weights, price_panel,
+            fee_rate=0.0, impact_coeff=impact_coeff,
+            adv_panel=adv_panel, portfolio_value=V,
+        )
+        # total_cost 对应的就是 impact_cost（fee=0），且只发生在 trade_bar
+        # net_returns.loc[trade_bar] = gross - impact
+        impact_at_trade_vec = (
+            result.gross_returns.iloc[trade_bar] - result.returns.iloc[trade_bar]
+        )
+
+        # --- 路径 2: cost.py，使用 vectorized 内部同样估出的 σ ---
+        # 复现 vectorized 内部的 σ 计算：rolling(60).std() × √1440（日化）
+        returns_panel = price_panel.pct_change()
+        vol_panel = returns_panel.rolling(60, min_periods=10).std() * np.sqrt(1440)
+        sigma_at_trade = vol_panel.iloc[trade_bar]  # pd.Series(index=symbols)
+
+        ctx = MarketContext(
+            timestamp=idx[trade_bar],
+            symbols=symbols,
+            spread=pd.Series([0.0, 0.0], index=symbols),   # 关 spread
+            volatility=sigma_at_trade,                      # 日化 σ
+            adv=pd.Series([adv_value, adv_value], index=symbols),
+            portfolio_value=V,
+        )
+
+        delta_w_at_trade = np.array([0.1, -0.05])
+        n_sym = len(symbols)
+        dw_var = cp.Variable(n_sym)
+        cost_expr = build_cost_expression(
+            dw_var, ctx, impact_coeff=impact_coeff, fee_rate=0.0,
+        )
+        prob = cp.Problem(cp.Minimize(cost_expr), [dw_var == delta_w_at_trade])
+        prob.solve()
+        impact_at_trade_costpy = prob.value
+
+        # --- 比对 ---
+        np.testing.assert_allclose(
+            impact_at_trade_vec, impact_at_trade_costpy, rtol=1e-4,
+            err_msg=(
+                f"vectorized_backtest 与 cost.py 的 impact 不一致:\n"
+                f"  vectorized = {impact_at_trade_vec:.10f}\n"
+                f"  cost.py    = {impact_at_trade_costpy:.10f}\n"
+                f"  ratio      = {impact_at_trade_vec / impact_at_trade_costpy:.4f}\n"
+                f"  (若 ratio ≈ 19.1，说明 σ 尺度问题回归)"
+            )
+        )

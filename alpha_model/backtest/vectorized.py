@@ -42,7 +42,6 @@ from alpha_model.config import (
     DEFAULT_FEE_RATE,
     DEFAULT_IMPACT_COEFF,
     DEFAULT_PORTFOLIO_VALUE,
-    MINUTES_PER_YEAR,
 )
 
 from factor_research.evaluation.metrics import cumulative_returns
@@ -71,7 +70,9 @@ def estimate_market_impact(
     Args:
         delta_weights:    权重变化面板 (timestamp × symbol)
         adv_panel:        日均成交量面板 (timestamp × symbol, USDT)
-        volatility_panel: 滚动波动率面板 (timestamp × symbol)
+        volatility_panel: 滚动波动率面板 (timestamp × symbol)，**日化** σ（非年化）。
+                          Almgren-Chriss 约定 σ 单位为 1/√day，与 ADV 日级尺度配套。
+                          传入年化 σ 会导致 impact 被高估 √365.25 ≈ 19 倍。
         portfolio_value:  组合总资金
         impact_coeff:     冲击系数（纯校准量，不含 2/3 prefactor）
 
@@ -146,8 +147,10 @@ def vectorized_backtest(
     # 2. 市场冲击（如果提供了 ADV）
     impact_cost = pd.Series(0.0, index=common_idx)
     if adv_panel is not None:
-        # 滚动波动率（60 bar）
-        vol_panel = returns_panel.rolling(60, min_periods=10).std() * np.sqrt(MINUTES_PER_YEAR)
+        # 滚动波动率（60 bar），**日化** σ（× √1440，而非年化）
+        # Almgren-Chriss impact 公式约定 σ 单位为 1/√day，与日级 ADV 配套。
+        # 与 execution_optimizer.MarketContext.volatility 的 docstring 口径一致。
+        vol_panel = returns_panel.rolling(60, min_periods=10).std() * np.sqrt(1440)
         adv_aligned = adv_panel.reindex(common_idx)[symbols]
 
         impact = estimate_market_impact(
