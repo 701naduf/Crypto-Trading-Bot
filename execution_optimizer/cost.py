@@ -5,18 +5,22 @@
 
 成本在收益率空间表达，与目标函数中 w'Σw 和 λ×α'w 量纲一致，可直接相加。
 
-量纲推导:
-    原始 USD 成本:
-      commission_USD = fee_rate × V × Σ|Δw_i|
-      spread_USD     = V × Σ(spread_i/2 × |Δw_i|)
-      impact_USD     = Σ(impact_coeff × σ_i × (V×|Δw_i|)^1.5 / √ADV_i)
+量纲推导（Almgren-Chriss 总冲击成本）:
+    边际冲击率（每单位交易量导致的价格偏离）:
+      marginal_impact(q) = σ × √(q / ADV)
 
-    ÷ V 归一化后:
-      commission = fee_rate × Σ|Δw_i|                               （无量纲）
-      spread     = Σ(spread_i/2 × |Δw_i|)                           （无量纲）
-      impact     = Σ(impact_coeff × σ_i × √(V/ADV_i) × |Δw_i|^1.5) （无量纲）
+    执行总量 Q 的总美元成本（对 q 从 0 到 Q 积分）:
+      total_impact_USD = ∫₀^Q σ × √(q/ADV) dq = (2/3) × σ × Q^1.5 / √ADV
 
-    √(V/ADV_i) 项体现组合规模效应：组合越大，相对冲击越高。
+    代入 Q = V × |Δw|，并 ÷ V 归一化:
+      commission = fee_rate × Σ|Δw_i|                                       （无量纲）
+      spread     = Σ(spread_i/2 × |Δw_i|)                                   （无量纲）
+      impact     = (2/3) × Σ(impact_coeff × σ_i × √(V/ADV_i) × |Δw_i|^1.5) （无量纲）
+
+    说明:
+      - 2/3 系数来自边际冲击率的积分，显式保留以便 impact_coeff 成为纯校准量
+        （从成交数据回归时，其值与 Almgren-Chriss 文献系数直接对应）
+      - √(V/ADV_i) 项体现组合规模效应：组合越大，相对冲击越高
 
 DCP 合规说明:
     - cp.abs(delta_w) → convex, nonneg
@@ -77,9 +81,10 @@ def build_cost_expression(
     half_spread = spread_arr / 2.0
     spread_cost = half_spread @ delta_abs
 
-    # ③ 市场冲击: Σ(eff_coeff_i × |Δw_i|^1.5)
+    # ③ 市场冲击: (2/3) × Σ(eff_coeff_i × |Δw_i|^1.5)
     #    eff_coeff_i = coeff_i × σ_i × √(V / ADV_i)
-    eff_coeff = coeff_arr * sigma_arr * np.sqrt(
+    #    2/3 来自 Almgren-Chriss 边际冲击率对 q 的积分，显式保留
+    eff_coeff = (2.0 / 3.0) * coeff_arr * sigma_arr * np.sqrt(
         V / np.maximum(adv_arr, 1.0)
     )
     impact_cost = eff_coeff @ cp.power(delta_abs, 1.5)

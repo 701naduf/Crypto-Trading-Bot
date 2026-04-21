@@ -10,9 +10,11 @@ P&L 计算:
 
 交易成本模型（两层）:
     1. 固定手续费: fee = turnover × fee_rate  (通常 0.04% taker)
-    2. 市场冲击 (size-dependent):
-       impact_i = impact_coeff × σ_i × sqrt(|Δw_i| × portfolio_value / ADV_i)
-       这是 Almgren-Chriss 模型的简化版（square-root model）。
+    2. 市场冲击 (size-dependent, Almgren-Chriss 总冲击成本):
+       边际冲击率 marginal_impact(q) = σ × √(q/ADV)
+       总成本 = ∫₀^Q σ × √(q/ADV) dq = (2/3) × σ × Q^1.5 / √ADV
+       代入 Q = |Δw_i| × V 并 ÷ V 归一化为收益率空间:
+       impact_i = (2/3) × impact_coeff × σ_i × √(V/ADV_i) × |Δw_i|^1.5
 
     total_cost_t = Σ(|Δw_i,t| × fee_rate + impact_i,t)
     net_return_t = portfolio_return_t - total_cost_t
@@ -21,6 +23,10 @@ P&L 计算:
     固定费率假设忽略了交易量对价格的影响。
     对于流动性较差的标的（如 DOGE/USDT），大单交易会显著推高成本。
     sqrt-model 是量化行业最常用的市场冲击估计方法。
+
+2/3 系数:
+    来自边际冲击率对 q 的积分，显式保留以使 impact_coeff 成为纯校准量
+    （从成交数据回归时与 Almgren-Chriss 文献系数直接对应）。
 """
 
 from __future__ import annotations
@@ -52,27 +58,26 @@ def estimate_market_impact(
     impact_coeff: float = DEFAULT_IMPACT_COEFF,
 ) -> pd.DataFrame:
     """
-    Square-root 市场冲击估计
+    Almgren-Chriss 总冲击成本估计（收益率空间）
 
-    公式: impact_i = impact_coeff × σ_i × sqrt(|ΔV_i| / ADV_i)
-    其中 ΔV_i = |Δw_i| × portfolio_value
+    公式: impact_i = (2/3) × impact_coeff × σ_i × √(V / ADV_i) × |Δw_i|^1.5
+
+    推导: 边际冲击率 σ√(q/ADV) 对 q 从 0 到 Q 积分得 (2/3)σQ^1.5/√ADV，
+    代入 Q = |Δw|×V 并 ÷ V 归一化到收益率空间。
+
+    与 execution_optimizer.cost.build_cost_expression 中的 impact 分量公式一致，
+    以支持"完美执行下事件驱动 ≈ 向量化"的可比性校验。
 
     Args:
         delta_weights:    权重变化面板 (timestamp × symbol)
         adv_panel:        日均成交量面板 (timestamp × symbol, USDT)
         volatility_panel: 滚动波动率面板 (timestamp × symbol)
         portfolio_value:  组合总资金
-        impact_coeff:     冲击系数
+        impact_coeff:     冲击系数（纯校准量，不含 2/3 prefactor）
 
     Returns:
         市场冲击成本面板 (timestamp × symbol)，单位为收益率
     """
-    # 交易金额: |Δw_i| × portfolio_value
-    trade_value = delta_weights.abs() * portfolio_value
-
-    # 参与率: trade_value / ADV
-    participation = trade_value / adv_panel.replace(0, np.nan)
-
     # 诊断: ADV=0 意味着该标的无流动性，冲击无法估计
     zero_adv_ratio = (adv_panel == 0).sum() / max(len(adv_panel), 1)
     for sym in zero_adv_ratio.index:
@@ -82,8 +87,11 @@ def estimate_market_impact(
                 sym, zero_adv_ratio[sym] * 100,
             )
 
-    # 冲击: coeff × σ × √participation
-    impact = impact_coeff * volatility_panel * np.sqrt(participation.clip(lower=0))
+    # Almgren-Chriss 总冲击成本: (2/3) × coeff × σ × √(V/ADV) × |Δw|^1.5
+    adv_safe = adv_panel.replace(0, np.nan)
+    impact = (2.0 / 3.0) * impact_coeff * volatility_panel \
+             * np.sqrt(portfolio_value / adv_safe) \
+             * delta_weights.abs().pow(1.5)
 
     return impact.fillna(0)
 

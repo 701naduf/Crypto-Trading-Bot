@@ -96,19 +96,12 @@ class TestT1CostNumericalCorrectness:
         spread_arr = np.array([0.0002, 0.0004])
         self.expected_spread = np.sum(spread_arr / 2.0 * abs_dw)
 
-        # ③ impact = Σ(coeff_i × σ_i × √(V/ADV_i) × |Δw_i|^1.5)
-        #   BTC: 0.1 × 0.02 × √(10000/1000000) × 0.1^1.5
-        #      = 0.1 × 0.02 × √0.01 × 0.031623
-        #      = 0.1 × 0.02 × 0.1 × 0.031623
-        #      = 0.000006325
-        #   ETH: 0.1 × 0.03 × √(10000/500000) × 0.05^1.5
-        #      = 0.1 × 0.03 × √0.02 × 0.011180
-        #      = 0.1 × 0.03 × 0.14142 × 0.011180
-        #      = 0.000004743
+        # ③ impact = (2/3) × Σ(coeff_i × σ_i × √(V/ADV_i) × |Δw_i|^1.5)
+        #   2/3 来自 Almgren-Chriss 边际冲击率对 q 的积分
         sigma_arr = np.array([0.02, 0.03])
         adv_arr = np.array([1_000_000.0, 500_000.0])
         V = 10_000.0
-        eff_coeff = self.impact_coeff * sigma_arr * np.sqrt(V / adv_arr)
+        eff_coeff = (2.0 / 3.0) * self.impact_coeff * sigma_arr * np.sqrt(V / adv_arr)
         self.expected_impact = np.sum(eff_coeff * abs_dw ** 1.5)
 
         self.expected_total = (
@@ -154,13 +147,13 @@ class TestT1CostNumericalCorrectness:
         symbols = self.context.symbols
         coeff_series = pd.Series([0.05, 0.2], index=symbols)
 
-        # 手工计算
+        # 手工计算（含 2/3 系数）
         abs_dw = np.abs(self.delta_w_val)
         sigma_arr = np.array([0.02, 0.03])
         adv_arr = np.array([1_000_000.0, 500_000.0])
         V = 10_000.0
         coeff_arr = np.array([0.05, 0.2])
-        eff_coeff = coeff_arr * sigma_arr * np.sqrt(V / adv_arr)
+        eff_coeff = (2.0 / 3.0) * coeff_arr * sigma_arr * np.sqrt(V / adv_arr)
         expected_impact = np.sum(eff_coeff * abs_dw ** 1.5)
 
         # 清除其他分量
@@ -234,3 +227,82 @@ class TestT3ZeroTradeCost:
             dw = np.zeros(2)
             cost = _eval_cost_at(dw, context)
             np.testing.assert_allclose(cost, 0.0, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# 跨模块一致性护栏：execution_optimizer.cost 与 alpha_model.backtest.vectorized
+# 的 impact 公式必须给出相同数值
+# ---------------------------------------------------------------------------
+
+class TestImpactFormulaConsistency:
+    """
+    护栏测试：cost.build_cost_expression 的 impact 分量
+    与 vectorized.estimate_market_impact 在相同输入下应精确相等。
+
+    这是 B.1 修复后的一致性保证——任一侧公式被改动都会挂。
+    支持 "完美执行下事件驱动 ≈ 向量化" 的可比性校验。
+    """
+
+    def test_impact_matches_vectorized_single_step(self):
+        """单步场景：cost.py impact 分量 == vectorized impact 分量"""
+        from alpha_model.backtest.vectorized import estimate_market_impact
+
+        # 固定输入
+        delta_w_val = np.array([0.1, -0.05])
+        ctx = _make_context(spread=[0.0, 0.0])  # 关掉 spread 和 fee，只测 impact
+        impact_coeff = 0.1
+
+        # cost.py 路径
+        cost_py_impact = _eval_cost_at(
+            delta_w_val, ctx, impact_coeff=impact_coeff, fee_rate=0.0,
+        )
+
+        # vectorized.py 路径（构造单行面板）
+        symbols = ctx.symbols
+        ts = pd.Timestamp("2026-01-01 00:00")
+        delta_w_panel = pd.DataFrame([delta_w_val], index=[ts], columns=symbols)
+        adv_panel = pd.DataFrame([ctx.adv.values], index=[ts], columns=symbols)
+        vol_panel = pd.DataFrame([ctx.volatility.values], index=[ts], columns=symbols)
+
+        vectorized_impact_panel = estimate_market_impact(
+            delta_weights=delta_w_panel,
+            adv_panel=adv_panel,
+            volatility_panel=vol_panel,
+            portfolio_value=ctx.portfolio_value,
+            impact_coeff=impact_coeff,
+        )
+        vectorized_impact_total = vectorized_impact_panel.sum(axis=1).iloc[0]
+
+        np.testing.assert_allclose(
+            cost_py_impact, vectorized_impact_total, rtol=1e-6,
+            err_msg="cost.py 与 vectorized.py 的 impact 公式数值不一致"
+        )
+
+    def test_impact_consistency_across_magnitudes(self):
+        """跨多个 |Δw| 量级，两侧仍一致（抓变化时的相对偏差）"""
+        from alpha_model.backtest.vectorized import estimate_market_impact
+
+        ctx = _make_context(spread=[0.0, 0.0])
+        impact_coeff = 0.1
+        symbols = ctx.symbols
+
+        for mag in [0.001, 0.01, 0.1, 0.5]:
+            dw = np.array([mag, -mag / 2])
+            cost_py_val = _eval_cost_at(dw, ctx, impact_coeff=impact_coeff, fee_rate=0.0)
+
+            ts = pd.Timestamp("2026-01-01 00:00")
+            dw_panel = pd.DataFrame([dw], index=[ts], columns=symbols)
+            adv_panel = pd.DataFrame([ctx.adv.values], index=[ts], columns=symbols)
+            vol_panel = pd.DataFrame([ctx.volatility.values], index=[ts], columns=symbols)
+
+            vec_val = estimate_market_impact(
+                delta_weights=dw_panel, adv_panel=adv_panel,
+                volatility_panel=vol_panel, portfolio_value=ctx.portfolio_value,
+                impact_coeff=impact_coeff,
+            ).sum(axis=1).iloc[0]
+
+            np.testing.assert_allclose(
+                cost_py_val, vec_val, rtol=1e-6,
+                err_msg=f"|Δw|={mag} 下两侧 impact 不一致: "
+                        f"cost.py={cost_py_val}, vectorized={vec_val}"
+            )
