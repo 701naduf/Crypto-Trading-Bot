@@ -113,8 +113,10 @@ class PortfolioConstructor:
             alpha = np.nan_to_num(alpha, nan=0.0)
 
             # 估计协方差矩阵
-            # 使用当前时刻之前的数据（不含当前行，避免前瞻）
-            returns_before = returns_panel.loc[:ts].iloc[:-1] if ts in returns_panel.index else returns_panel.loc[:ts]
+            # 因子是 bar-close 语义（Phase 3 口径约定）：signal_t 在 bar t close 可用，
+            # 此时 r_t = close_t/close_{t-1} - 1 已实现，可纳入协方差估计。
+            # 与 execution_optimizer.optimize_step 保持一致（两条路径协方差输入对齐）。
+            returns_before = returns_panel.loc[:ts]
             cov_lookback = min(
                 self.constraints.vol_lookback, len(returns_before),
             )
