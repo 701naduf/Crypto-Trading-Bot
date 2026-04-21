@@ -677,3 +677,92 @@ class TestEdgeCases:
 
         # dollar_neutral: Σw = 0，单标的只能 w=0
         np.testing.assert_allclose(result.values, [0.0], atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 缩放护栏：ExecutionOptimizer 的 periods_per_year 参数化
+# ---------------------------------------------------------------------------
+
+class TestOptimizerPeriodsPerYear:
+    """
+    方案 2 的 optimizer 护栏：vol_target 缩放正确使用了 periods_per_year。
+
+    逻辑：
+      port_vol = √(w'Σw × periods_per_year) = 年化波动率
+      scale = vol_target / port_vol
+    相同 w / Σ 下，较大 periods_per_year → 较大 port_vol → 较小 scale → 较小 |w|。
+    """
+
+    def test_vol_target_scaling_uses_periods_per_year(self):
+        """
+        两个相同 constraints（含 vol_target）的 optimizer，仅 periods_per_year
+        不同，返回权重应按 1/√(periods_per_year) 比例关系。
+        """
+        from alpha_model.config import MINUTES_PER_YEAR
+
+        # 关键：vol_target 开启、leverage_cap 足够大（避免二次缩放触发）
+        constraints = _default_constraints(
+            vol_target=0.30,      # 足够大的 vol_target，配合足够大的 leverage
+            dollar_neutral=False, leverage_cap=10.0,
+        )
+
+        opt_1m = ExecutionOptimizer(
+            constraints, max_participation=None,
+            periods_per_year=MINUTES_PER_YEAR,       # 525960
+        )
+        opt_5m = ExecutionOptimizer(
+            constraints, max_participation=None,
+            periods_per_year=MINUTES_PER_YEAR / 5.0, # 105192
+        )
+
+        signals = pd.Series([0.5, -0.3], index=SYMBOLS)
+        current_w = pd.Series([0.0, 0.0], index=SYMBOLS)
+        context = _make_context()
+        prices = _make_price_history()
+
+        w_1m = opt_1m.optimize_step(signals, current_w, context, prices)
+        w_5m = opt_5m.optimize_step(signals, current_w, context, prices)
+
+        # 1m 年化系数更大 → port_vol 更大 → scale 更小 → |w| 更小
+        # 精确比例：|w_5m| / |w_1m| = √(525960/105192) = √5 ≈ 2.236
+        # 前提：二者都未触发 leverage_cap 二次缩放
+        lev_1m = np.abs(w_1m.values).sum()
+        lev_5m = np.abs(w_5m.values).sum()
+
+        assert lev_1m < constraints.leverage_cap - 1e-3, (
+            f"1m 路径触发了 leverage_cap，测试条件无效 (|w|={lev_1m:.4f})"
+        )
+        assert lev_5m < constraints.leverage_cap - 1e-3, (
+            f"5m 路径触发了 leverage_cap，测试条件无效 (|w|={lev_5m:.4f})"
+        )
+
+        expected_ratio = np.sqrt(5.0)
+        actual_ratio = lev_5m / lev_1m
+        np.testing.assert_allclose(
+            actual_ratio, expected_ratio, rtol=1e-3,
+            err_msg=f"|w_1m|={lev_1m}, |w_5m|={lev_5m}, "
+                    f"expected ratio={expected_ratio}"
+        )
+
+    def test_default_periods_per_year_matches_minutes(self):
+        """默认构造行为等同于显式传 MINUTES_PER_YEAR（向后兼容）"""
+        from alpha_model.config import MINUTES_PER_YEAR
+
+        constraints = _default_constraints(
+            vol_target=0.20, dollar_neutral=False, leverage_cap=5.0,
+        )
+        opt_default = ExecutionOptimizer(constraints, max_participation=None)
+        opt_explicit = ExecutionOptimizer(
+            constraints, max_participation=None,
+            periods_per_year=MINUTES_PER_YEAR,
+        )
+
+        signals = pd.Series([0.5, -0.3], index=SYMBOLS)
+        current_w = pd.Series([0.0, 0.0], index=SYMBOLS)
+        context = _make_context()
+        prices = _make_price_history()
+
+        w_default = opt_default.optimize_step(signals, current_w, context, prices)
+        w_explicit = opt_explicit.optimize_step(signals, current_w, context, prices)
+
+        np.testing.assert_allclose(w_default.values, w_explicit.values, rtol=1e-10)

@@ -42,6 +42,7 @@ from alpha_model.config import (
     DEFAULT_FEE_RATE,
     DEFAULT_IMPACT_COEFF,
     DEFAULT_PORTFOLIO_VALUE,
+    MINUTES_PER_YEAR,
 )
 
 from factor_research.evaluation.metrics import cumulative_returns
@@ -104,18 +105,23 @@ def vectorized_backtest(
     impact_coeff: float = DEFAULT_IMPACT_COEFF,
     adv_panel: pd.DataFrame | None = None,
     portfolio_value: float = DEFAULT_PORTFOLIO_VALUE,
+    periods_per_year: float = MINUTES_PER_YEAR,
 ) -> BacktestResult:
     """
     向量化回测
 
     Args:
-        weights:         目标权重面板 (timestamp × symbol)
-        price_panel:     价格面板 (timestamp × symbol)
-        fee_rate:        单边手续费率（0.0004 = 0.04% Binance taker）
-        impact_coeff:    市场冲击系数（默认 0.1，可根据回测校准）
-        adv_panel:       日均成交量面板 (timestamp × symbol, 单位 USDT)
-                         None 则退化为纯手续费模型（无市场冲击）
-        portfolio_value: 组合总资金（用于将权重转为实际交易金额）
+        weights:          目标权重面板 (timestamp × symbol)
+        price_panel:      价格面板 (timestamp × symbol)
+        fee_rate:         单边手续费率（0.0004 = 0.04% Binance taker）
+        impact_coeff:     市场冲击系数（默认 0.1，可根据回测校准）
+        adv_panel:        日均成交量面板 (timestamp × symbol, 单位 USDT)
+                          None 则退化为纯手续费模型（无市场冲击）
+        portfolio_value:  组合总资金（用于将权重转为实际交易金额）
+        periods_per_year: 年化系数。默认 `MINUTES_PER_YEAR` (525960) 对应 1m bar。
+                          内部用于把 bar 级波动率转为 impact 公式所需的**日化** σ
+                          （`bars_per_day = periods_per_year / 365.25`）。
+                          其他频率：5m→105192, 15m→35064, 1h→8766。
 
     Returns:
         BacktestResult
@@ -147,10 +153,10 @@ def vectorized_backtest(
     # 2. 市场冲击（如果提供了 ADV）
     impact_cost = pd.Series(0.0, index=common_idx)
     if adv_panel is not None:
-        # 滚动波动率（60 bar），**日化** σ（× √1440，而非年化）
-        # Almgren-Chriss impact 公式约定 σ 单位为 1/√day，与日级 ADV 配套。
-        # 与 execution_optimizer.MarketContext.volatility 的 docstring 口径一致。
-        vol_panel = returns_panel.rolling(60, min_periods=10).std() * np.sqrt(1440)
+        # 滚动波动率（60 bar），**日化** σ，与 Almgren-Chriss 约定配套
+        # bars_per_day 由 periods_per_year 推导：1m→1440, 5m→288, 1h→24
+        bars_per_day = periods_per_year / 365.25
+        vol_panel = returns_panel.rolling(60, min_periods=10).std() * np.sqrt(bars_per_day)
         adv_aligned = adv_panel.reindex(common_idx)[symbols]
 
         impact = estimate_market_impact(

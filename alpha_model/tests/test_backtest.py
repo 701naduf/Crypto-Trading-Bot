@@ -324,3 +324,153 @@ class TestImpactEndToEndConsistency:
                 f"  (若 ratio ≈ 19.1，说明 σ 尺度问题回归)"
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# 缩放护栏：periods_per_year 参数被正确透传到年化/日化系数
+# ---------------------------------------------------------------------------
+
+class TestPeriodsPerYearParameterization:
+    """
+    方案 2（periods_per_year 参数化）的护栏测试。
+
+    核心思想：相同 returns / weights / prices 输入，改变 periods_per_year
+    参数时，年化或日化相关的输出应按已知公式精确缩放。
+
+    覆盖三个对外入口:
+      - BacktestResult.summary()
+      - vectorized_backtest()
+      - apply_vol_target()  (ExecutionOptimizer 的测试在 test_optimizer.py)
+    """
+
+    def test_summary_annual_volatility_scales_with_sqrt_periods(self):
+        """summary 的 annual_volatility 应按 √periods_per_year 缩放"""
+        rng = np.random.RandomState(42)
+        idx = pd.date_range("2024-01-01", periods=500, freq="1min", tz="UTC")
+        returns = pd.Series(rng.randn(500) * 0.001, index=idx)
+
+        result = BacktestResult(
+            equity_curve=cumulative_returns(returns),
+            returns=returns,
+            turnover=pd.Series(0.0, index=idx),
+            weights_history=pd.DataFrame(index=idx),
+        )
+
+        s_minute = result.summary(periods_per_year=525960.0)   # 1m
+        s_fiveminute = result.summary(periods_per_year=105192.0)  # 5m
+
+        # annual_vol = std × √periods → ratio = √(525960/105192) = √5 ≈ 2.236
+        expected_ratio = np.sqrt(525960.0 / 105192.0)
+        actual_ratio = s_minute["annual_volatility"] / s_fiveminute["annual_volatility"]
+        np.testing.assert_allclose(actual_ratio, expected_ratio, rtol=1e-6)
+
+    def test_summary_default_matches_explicit_minutes_per_year(self):
+        """默认参数行为等同于显式传 MINUTES_PER_YEAR（向后兼容）"""
+        from alpha_model.config import MINUTES_PER_YEAR
+        rng = np.random.RandomState(7)
+        idx = pd.date_range("2024-01-01", periods=200, freq="1min", tz="UTC")
+        returns = pd.Series(rng.randn(200) * 0.001, index=idx)
+
+        result = BacktestResult(
+            equity_curve=cumulative_returns(returns),
+            returns=returns,
+            turnover=pd.Series(0.0, index=idx),
+            weights_history=pd.DataFrame(index=idx),
+        )
+
+        s_default = result.summary()
+        s_explicit = result.summary(periods_per_year=MINUTES_PER_YEAR)
+
+        for key in ("annual_return", "annual_volatility", "sharpe_ratio"):
+            np.testing.assert_allclose(s_default[key], s_explicit[key], rtol=1e-12)
+
+    def test_vectorized_backtest_impact_scales_with_bars_per_day(self):
+        """
+        vectorized_backtest 的 impact 使用 √(periods_per_year / 365.25) 作为
+        bars_per_day 换算日化 σ。相同输入下，改变 periods_per_year 应按
+        √ratio 缩放 impact。
+        """
+        symbols = ["BTC/USDT"]
+        n = 120
+        idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+        rng = np.random.RandomState(11)
+
+        rets = rng.randn(n, 1) * 0.001
+        prices = 100 * np.exp(np.cumsum(rets, axis=0))
+        price_panel = pd.DataFrame(prices, index=idx, columns=symbols)
+
+        trade_bar = 80
+        w = np.zeros((n, 1))
+        w[trade_bar:, 0] = 0.1
+        weights = pd.DataFrame(w, index=idx, columns=symbols)
+        adv_panel = pd.DataFrame(1_000_000.0, index=idx, columns=symbols)
+
+        result_1m = vectorized_backtest(
+            weights, price_panel, fee_rate=0.0, adv_panel=adv_panel,
+            portfolio_value=10_000.0, periods_per_year=525960.0,
+        )
+        result_5m = vectorized_backtest(
+            weights, price_panel, fee_rate=0.0, adv_panel=adv_panel,
+            portfolio_value=10_000.0, periods_per_year=105192.0,
+        )
+
+        impact_1m = (result_1m.gross_returns.iloc[trade_bar]
+                     - result_1m.returns.iloc[trade_bar])
+        impact_5m = (result_5m.gross_returns.iloc[trade_bar]
+                     - result_5m.returns.iloc[trade_bar])
+
+        # impact ∝ √(bars_per_day) = √(periods_per_year / 365.25)
+        # ratio = √(525960/105192) = √5
+        expected_ratio = np.sqrt(525960.0 / 105192.0)
+        actual_ratio = impact_1m / impact_5m
+        np.testing.assert_allclose(actual_ratio, expected_ratio, rtol=1e-4)
+
+
+class TestApplyVolTargetPeriodsPerYear:
+    """apply_vol_target 的 periods_per_year 参数化护栏"""
+
+    def test_apply_vol_target_scales_with_sqrt_periods(self):
+        """
+        apply_vol_target 的 rolling_vol 按 √periods_per_year 缩放。
+        相同 vol_target 下，较大 periods_per_year 估出的 port_vol 更大，
+        scale 因子较小，导致 weights 被更多压缩。
+        """
+        from alpha_model.portfolio.risk_budget import apply_vol_target
+
+        symbols = ["A", "B"]
+        n = 200
+        idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+        rng = np.random.RandomState(23)
+
+        rets = rng.randn(n, 2) * 0.01  # 较大波动以触发 vol target
+        prices = 100 * np.exp(np.cumsum(rets, axis=0))
+        price_panel = pd.DataFrame(prices, index=idx, columns=symbols)
+        weights = pd.DataFrame(
+            np.tile([0.5, -0.5], (n, 1)), index=idx, columns=symbols,
+        )
+
+        # 同样的 vol_target=0.2 (年化 20%), 不同 periods_per_year
+        adj_1m = apply_vol_target(
+            weights, price_panel, vol_target=0.2, lookback=60,
+            periods_per_year=525960.0,
+        )
+        adj_5m = apply_vol_target(
+            weights, price_panel, vol_target=0.2, lookback=60,
+            periods_per_year=105192.0,
+        )
+
+        # 取某个有效行（rolling_vol 已稳定）
+        check_idx = idx[150]
+
+        w_1m = adj_1m.loc[check_idx].abs().sum()
+        w_5m = adj_5m.loc[check_idx].abs().sum()
+
+        # 1m 声称年化系数更大 → port_vol 估得更大 → scale 更小 → |w| 更小
+        # 具体 ratio: scale ∝ 1 / √periods → |w| ∝ 1/√periods
+        # ratio = w_5m / w_1m = √(525960/105192) = √5 ≈ 2.236
+        # 前提：未触发 leverage_cap
+        expected_ratio = np.sqrt(525960.0 / 105192.0)
+        actual_ratio = w_5m / w_1m
+        # 若触发 leverage_cap 二次缩放，比例会偏离；测试构造保证未触发
+        np.testing.assert_allclose(actual_ratio, expected_ratio, rtol=1e-4,
+            err_msg=f"w_1m={w_1m}, w_5m={w_5m}, expected ratio={expected_ratio}")

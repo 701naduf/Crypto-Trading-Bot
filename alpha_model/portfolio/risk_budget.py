@@ -28,6 +28,7 @@ def apply_vol_target(
     vol_target: float = 0.15,
     lookback: int = 60,
     leverage_cap: float = 2.0,
+    periods_per_year: float = MINUTES_PER_YEAR,
 ) -> pd.DataFrame:
     """
     波动率目标调整
@@ -35,11 +36,15 @@ def apply_vol_target(
     对每个时刻的权重进行缩放，使组合预期年化波动率接近 vol_target。
 
     Args:
-        weights:      目标权重面板 (timestamp × symbol)
-        price_panel:  价格面板 (timestamp × symbol)，用于计算组合收益率
-        vol_target:   年化波动率目标（如 0.15 = 15%）
-        lookback:     波动率估计窗口（bar 数）
-        leverage_cap: 最大杠杆倍数
+        weights:          目标权重面板 (timestamp × symbol)
+        price_panel:      价格面板 (timestamp × symbol)，用于计算组合收益率
+        vol_target:       年化波动率目标（如 0.15 = 15%）
+        lookback:         波动率估计窗口（bar 数）
+        leverage_cap:     最大杠杆倍数
+        periods_per_year: 年化系数。默认 `MINUTES_PER_YEAR` (525960) 对应 1m bar。
+                          其他频率：5m→105192, 15m→35064, 1h→8766。
+                          改变此值需同时评估 `lookback` 的经济含义
+                          （见 docs/phase3_debug.md §八）。
 
     Returns:
         调整后的权重面板
@@ -55,10 +60,10 @@ def apply_vol_target(
     shifted_weights = weights.shift(1)
     portfolio_returns = (shifted_weights * returns_panel).sum(axis=1)
 
-    # 滚动年化波动率
+    # 滚动年化波动率（按 periods_per_year 年化，兼容任何 bar 频率）
     rolling_vol = portfolio_returns.rolling(
         window=lookback, min_periods=max(lookback // 2, 2),
-    ).std() * np.sqrt(MINUTES_PER_YEAR)
+    ).std() * np.sqrt(periods_per_year)
 
     # 缩放因子
     scale = vol_target / rolling_vol.replace(0, np.nan)

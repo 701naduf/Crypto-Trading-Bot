@@ -54,6 +54,7 @@ class ExecutionOptimizer:
         impact_coeff: float | pd.Series = DEFAULT_IMPACT_COEFF,
         fee_rate: float = DEFAULT_FEE_RATE,
         max_participation: float | None = DEFAULT_MAX_PARTICIPATION,
+        periods_per_year: float = MINUTES_PER_YEAR,
     ):
         """
         Args:
@@ -68,11 +69,19 @@ class ExecutionOptimizer:
             max_participation: 单步最大 ADV 参与率。
                                0.05 = 单步交易量不超过 ADV 的 5%。
                                None = 不限制（不推荐用于实盘）。
+            periods_per_year:  年化系数，用于 vol_target 缩放中把 1 期方差
+                               (`w'Σw`) 转为年化波动率。默认 `MINUTES_PER_YEAR`
+                               (525960)，对应 price_history 是 1m bar。
+                               其他频率：5m→105192, 15m→35064, 1h→8766。
+                               改变此值必须保证 price_history 的频率与之匹配
+                               （协方差矩阵 Σ 来自 price_history.pct_change()，
+                               单期方差的时间尺度 = price_history 的 bar 尺度）。
         """
         self.constraints = constraints
         self.impact_coeff = impact_coeff
         self.fee_rate = fee_rate
         self.max_participation = max_participation
+        self.periods_per_year = periods_per_year
 
     def optimize_step(
         self,
@@ -181,8 +190,8 @@ class ExecutionOptimizer:
         # Phase 2b 使用 apply_vol_target（面板级函数，依赖 shift(1)，不适用于单步）。
         # 此处使用协方差矩阵直接估计组合波动率，无需历史组合收益序列。
         if self.constraints.vol_target is not None:
-            port_var = w_opt @ cov @ w_opt                    # 1 分钟方差
-            port_vol = np.sqrt(port_var * MINUTES_PER_YEAR)   # 年化波动率
+            port_var = w_opt @ cov @ w_opt                        # 1 期方差（bar 尺度）
+            port_vol = np.sqrt(port_var * self.periods_per_year)  # 年化波动率
 
             if port_vol > 0:
                 scale = self.constraints.vol_target / port_vol

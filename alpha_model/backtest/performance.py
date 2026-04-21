@@ -137,9 +137,18 @@ class BacktestResult:
     gross_returns: pd.Series | None = None   # 毛收益
     total_cost: float = 0.0                  # 总交易成本
 
-    def summary(self) -> dict:
+    def summary(self, periods_per_year: float = MINUTES_PER_YEAR) -> dict:
         """
         生成绩效摘要
+
+        Args:
+            periods_per_year: 年化系数，每年的 bar 数。默认 `MINUTES_PER_YEAR`
+                              (525960 = 365.25×24×60)，对应 1m bar crypto 7×24 市场。
+                              其他频率下调用方必须显式传入正确值（5m: 105192、
+                              15m: 35064、1h: 8766）。
+
+                              注意：改变此值需同时评估 `lookback` 等窗口参数的
+                              经济含义是否仍成立（方案 3 备忘，见 docs/phase3_debug.md §八）。
 
         Returns:
             绩效指标字典
@@ -152,11 +161,11 @@ class BacktestResult:
         cum = cumulative_returns(returns)
 
         return {
-            "annual_return": annualize_return(returns, MINUTES_PER_YEAR),
-            "annual_volatility": annualize_volatility(returns, MINUTES_PER_YEAR),
-            "sharpe_ratio": sharpe_ratio(returns, MINUTES_PER_YEAR),
-            "sortino_ratio": sortino_ratio(returns, MINUTES_PER_YEAR),
-            "calmar_ratio": calmar_ratio(returns, MINUTES_PER_YEAR),
+            "annual_return": annualize_return(returns, periods_per_year),
+            "annual_volatility": annualize_volatility(returns, periods_per_year),
+            "sharpe_ratio": sharpe_ratio(returns, periods_per_year),
+            "sortino_ratio": sortino_ratio(returns, periods_per_year),
+            "calmar_ratio": calmar_ratio(returns, periods_per_year),
             "max_drawdown": max_drawdown(cum),
             "max_drawdown_duration": max_drawdown_duration(returns),
             "avg_turnover": self.turnover.mean() if len(self.turnover) > 0 else 0.0,
