@@ -474,3 +474,120 @@ class TestApplyVolTargetPeriodsPerYear:
         # 若触发 leverage_cap 二次缩放，比例会偏离；测试构造保证未触发
         np.testing.assert_allclose(actual_ratio, expected_ratio, rtol=1e-4,
             err_msg=f"w_1m={w_1m}, w_5m={w_5m}, expected ratio={expected_ratio}")
+
+
+# ---------------------------------------------------------------------------
+# B.4: vectorized_backtest 的 spread_panel 可选输入
+# ---------------------------------------------------------------------------
+
+class TestVectorizedSpreadPanel:
+    """
+    spread_panel 是 Phase 3 可比性校验需要的扩展：
+    允许 vectorized_backtest 计算与 execution_optimizer.cost 对齐的三分量成本
+    （fee + spread + impact）而不仅是 Phase 2b 旧行为（fee + impact）。
+    """
+
+    def _setup_inputs(self, n=50, seed=5):
+        """构造简单的回测输入"""
+        symbols = ["A", "B"]
+        idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+        rng = np.random.RandomState(seed)
+        rets = rng.randn(n, 2) * 0.001
+        prices = 100 * np.exp(np.cumsum(rets, axis=0))
+        price_panel = pd.DataFrame(prices, index=idx, columns=symbols)
+
+        # 每期换仓以产生非零 Δw
+        weights = pd.DataFrame(
+            rng.randn(n, 2) * 0.2, index=idx, columns=symbols,
+        )
+        return weights, price_panel, symbols, idx
+
+    def test_default_no_spread_panel_backwards_compatible(self):
+        """不传 spread_panel 时行为与旧版完全一致（回归保护）"""
+        weights, prices, symbols, idx = self._setup_inputs()
+
+        # 两次调用：一次完全不传 spread_panel，一次显式传 None
+        result_implicit = vectorized_backtest(
+            weights, prices, fee_rate=0.0004, adv_panel=None,
+        )
+        result_explicit = vectorized_backtest(
+            weights, prices, fee_rate=0.0004, adv_panel=None, spread_panel=None,
+        )
+
+        np.testing.assert_allclose(
+            result_implicit.total_cost, result_explicit.total_cost, rtol=1e-12,
+        )
+        pd.testing.assert_series_equal(
+            result_implicit.returns, result_explicit.returns,
+        )
+
+    def test_spread_panel_increases_total_cost(self):
+        """提供 spread_panel 时 total_cost 严格增加"""
+        weights, prices, symbols, idx = self._setup_inputs()
+
+        spread_panel = pd.DataFrame(0.0005, index=idx, columns=symbols)  # 5 bps
+
+        result_without = vectorized_backtest(
+            weights, prices, fee_rate=0.0004, adv_panel=None,
+        )
+        result_with = vectorized_backtest(
+            weights, prices, fee_rate=0.0004, adv_panel=None,
+            spread_panel=spread_panel,
+        )
+
+        assert result_with.total_cost > result_without.total_cost, (
+            f"加入 spread 后成本应增加: "
+            f"without={result_without.total_cost}, with={result_with.total_cost}"
+        )
+
+    def test_spread_cost_exact_formula(self):
+        """spread_cost 精确等于 Σ(spread_i/2 × |Δw_i|) 的累加值（与 cost.py 一致）"""
+        weights, prices, symbols, idx = self._setup_inputs()
+        spread_panel = pd.DataFrame(0.001, index=idx, columns=symbols)  # 10 bps
+
+        # 只开 spread，关其他成本
+        result = vectorized_backtest(
+            weights, prices, fee_rate=0.0, adv_panel=None,
+            spread_panel=spread_panel,
+        )
+
+        # 手算预期值：Σ_t Σ_i (spread_i / 2 × |Δw_{i,t}|)
+        delta_w = weights.diff().abs()
+        half_spread = spread_panel / 2.0
+        expected_per_bar = (delta_w * half_spread).sum(axis=1).fillna(0.0)
+        expected_total = expected_per_bar.sum()
+
+        np.testing.assert_allclose(result.total_cost, expected_total, rtol=1e-10)
+
+    def test_spread_panel_with_impact_composable(self):
+        """spread_panel 与 adv_panel 可同时使用，三分量独立相加"""
+        weights, prices, symbols, idx = self._setup_inputs()
+        spread_panel = pd.DataFrame(0.0005, index=idx, columns=symbols)
+        adv_panel = pd.DataFrame(1_000_000.0, index=idx, columns=symbols)
+
+        result_all = vectorized_backtest(
+            weights, prices, fee_rate=0.0004,
+            adv_panel=adv_panel, spread_panel=spread_panel,
+        )
+        result_no_spread = vectorized_backtest(
+            weights, prices, fee_rate=0.0004,
+            adv_panel=adv_panel, spread_panel=None,
+        )
+        result_no_adv = vectorized_backtest(
+            weights, prices, fee_rate=0.0004,
+            adv_panel=None, spread_panel=spread_panel,
+        )
+        result_fee_only = vectorized_backtest(
+            weights, prices, fee_rate=0.0004,
+            adv_panel=None, spread_panel=None,
+        )
+
+        # 分量可加性：三分量 total == fee + spread + impact
+        # spread 贡献 = result_no_adv - result_fee_only
+        # impact 贡献 = result_no_spread - result_fee_only
+        # 三分量之和应等于 result_all
+        spread_contribution = result_no_adv.total_cost - result_fee_only.total_cost
+        impact_contribution = result_no_spread.total_cost - result_fee_only.total_cost
+        expected_all = result_fee_only.total_cost + spread_contribution + impact_contribution
+
+        np.testing.assert_allclose(result_all.total_cost, expected_all, rtol=1e-10)

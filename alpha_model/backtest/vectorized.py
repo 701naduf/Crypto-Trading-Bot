@@ -8,16 +8,20 @@ P&L 计算:
     portfolio_return_t = Σ(w_{i,t-1} × r_{i,t})
     其中 w 是 t-1 时刻的目标权重，r 是 t 时刻的实际收益
 
-交易成本模型（两层）:
+交易成本模型（三层，与 execution_optimizer.cost 口径一致）:
     1. 固定手续费: fee = turnover × fee_rate  (通常 0.04% taker)
-    2. 市场冲击 (size-dependent, Almgren-Chriss 总冲击成本):
+    2. 买卖价差: spread_i = spread_i / 2 × |Δw_i|          （需传 spread_panel）
+    3. 市场冲击 (size-dependent, Almgren-Chriss 总冲击成本):
        边际冲击率 marginal_impact(q) = σ × √(q/ADV)
        总成本 = ∫₀^Q σ × √(q/ADV) dq = (2/3) × σ × Q^1.5 / √ADV
        代入 Q = |Δw_i| × V 并 ÷ V 归一化为收益率空间:
        impact_i = (2/3) × impact_coeff × σ_i × √(V/ADV_i) × |Δw_i|^1.5
 
-    total_cost_t = Σ(|Δw_i,t| × fee_rate + impact_i,t)
+    total_cost_t = Σ(|Δw_i,t| × fee_rate) + spread_cost_t + impact_t
     net_return_t = portfolio_return_t - total_cost_t
+
+    spread 和 impact 分量各自可选（仅传入对应面板时启用），支持"仅 fee"、
+    "fee+impact"（Phase 2b 旧行为）、"完整三分量"三种模式。
 
 为什么需要市场冲击模型？
     固定费率假设忽略了交易量对价格的影响。
@@ -104,11 +108,23 @@ def vectorized_backtest(
     fee_rate: float = DEFAULT_FEE_RATE,
     impact_coeff: float = DEFAULT_IMPACT_COEFF,
     adv_panel: pd.DataFrame | None = None,
+    spread_panel: pd.DataFrame | None = None,
     portfolio_value: float = DEFAULT_PORTFOLIO_VALUE,
     periods_per_year: float = MINUTES_PER_YEAR,
 ) -> BacktestResult:
     """
     向量化回测
+
+    交易成本三分量（与 execution_optimizer.cost 口径一致）:
+        1. 手续费  fee      = fee_rate × Σ|Δw|
+        2. 买卖价差 spread   = Σ(spread_i/2 × |Δw_i|)    ← 需传入 spread_panel
+        3. 市场冲击 impact   = (2/3) × coeff × σ × √(V/ADV) × |Δw|^1.5   ← 需传入 adv_panel
+
+    spread_panel 和 adv_panel 分别独立可选，支持三种组合：
+        - 仅 fee（spread/adv 都不传）：最快，但会显著低估成本
+        - fee + impact（只传 adv）：Phase 2b 历史行为，向后兼容
+        - fee + spread + impact（都传）：与 execution_optimizer 三分量一致，
+          适合 Phase 3 事件驱动回测的"完美执行 ≈ 向量化"可比性校验
 
     Args:
         weights:          目标权重面板 (timestamp × symbol)
@@ -117,6 +133,8 @@ def vectorized_backtest(
         impact_coeff:     市场冲击系数（默认 0.1，可根据回测校准）
         adv_panel:        日均成交量面板 (timestamp × symbol, 单位 USDT)
                           None 则退化为纯手续费模型（无市场冲击）
+        spread_panel:     买卖价差面板 (timestamp × symbol)，比率形式 (ask-bid)/mid
+                          None 则不计入价差成本（默认，向后兼容 Phase 2b 旧行为）
         portfolio_value:  组合总资金（用于将权重转为实际交易金额）
         periods_per_year: 年化系数。默认 `MINUTES_PER_YEAR` (525960) 对应 1m bar。
                           内部用于把 bar 级波动率转为 impact 公式所需的**日化** σ
@@ -147,10 +165,16 @@ def vectorized_backtest(
     turnover = delta_w.abs().sum(axis=1)
 
     # --- 交易成本 ---
-    # 1. 固定手续费
+    # 1. 固定手续费: fee_rate × Σ|Δw|
     fee_cost = turnover * fee_rate
 
-    # 2. 市场冲击（如果提供了 ADV）
+    # 2. 买卖价差: Σ(spread_i/2 × |Δw_i|)（与 execution_optimizer.cost 一致）
+    spread_cost = pd.Series(0.0, index=common_idx)
+    if spread_panel is not None:
+        spread_aligned = spread_panel.reindex(common_idx)[symbols]
+        spread_cost = (spread_aligned / 2.0 * delta_w.abs()).sum(axis=1).fillna(0.0)
+
+    # 3. 市场冲击（如果提供了 ADV）
     impact_cost = pd.Series(0.0, index=common_idx)
     if adv_panel is not None:
         # 滚动波动率（60 bar），**日化** σ，与 Almgren-Chriss 约定配套
@@ -165,7 +189,7 @@ def vectorized_backtest(
         )
         impact_cost = impact.sum(axis=1)
 
-    total_cost_series = fee_cost + impact_cost
+    total_cost_series = fee_cost + spread_cost + impact_cost
     total_cost_scalar = total_cost_series.sum()
 
     # 净收益
