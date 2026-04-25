@@ -242,3 +242,35 @@ class TestConsistency:
         fg_fee = rep_fg.cost_breakdown["absolute"]["fee"]
         # 允许小差异：合成 weights 在两条路径下经过略微不同的 NaN 处理
         assert abs(vec_fee - fg_fee) / max(abs(vec_fee), 1e-10) < 0.05
+
+
+# ---------------------------------------------------------------------------
+# Step 1 (C5): VECTORIZED 模式 σ 跨模式同源
+# ---------------------------------------------------------------------------
+
+class TestVolConsistencyAcrossModes:
+    """
+    C5: VECTORIZED 用 panels["vol_panel"]（context_builder σ：20-day rolling）
+    而非内部 60-min σ。让 base.total_cost 与 cost_breakdown.total 用同一 σ。
+
+    用非零 impact_coeff 验证（zero friction 下 σ 与 P&L 无关，不暴露不一致）。
+    """
+
+    def test_vectorized_base_and_cost_breakdown_same_sigma(
+        self, fake_reader, synthetic_signal_store, vec_config,
+    ):
+        """
+        VECTORIZED 模式下 base.total_cost ≈ cost_breakdown["absolute"]["total"]
+        rtol=1e-10（同一 σ 算的 impact 应严格一致）
+        """
+        rep = EventDrivenBacktester().run(
+            vec_config, reader=fake_reader, signal_store=synthetic_signal_store,
+        )
+        # base.total_cost 来自 vectorized_backtest（用 panels["vol_panel"]）
+        # cost_breakdown 来自 _vectorized_cost_breakdown（也用 panels["vol_panel"]）
+        # 两路径同 σ → 数值一致
+        base_total = rep.base.total_cost
+        cb_total = rep.cost_breakdown["absolute"]["total"]
+        # rtol=1e-10 严格断言两路径同源
+        import numpy as np
+        np.testing.assert_allclose(base_total, cb_total, rtol=1e-10)

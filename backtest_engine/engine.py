@@ -308,6 +308,7 @@ class EventDrivenBacktester:
             impact_coeff=config.impact_coeff,
             adv_panel=panels["adv_panel"],
             spread_panel=spread_arg,
+            vol_panel=panels["vol_panel"],     # ★ Step 1 (C5): 跨模式 σ 同源
             portfolio_value=config.initial_portfolio_value,
             periods_per_year=config.periods_per_year,
         )
