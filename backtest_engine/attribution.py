@@ -206,8 +206,12 @@ def deviation_attribution(
         total_funding_rate = (
             float(settlement["total_rate"]) if settlement else 0.0
         )
-        # 去掉 funding 总扣款 → terminal return 增加 -total_funding_rate
-        funding_delta = -total_funding_rate
+        # vec-ed 约定（Step 3 / A2 / Z7 修订）:
+        #   PnLTracker._V *= (1 - funding_total)
+        #   funding_total > 0 (扣款) → ed 减 → (vec - ed) 增加 → funding 对 (vec-ed) 的贡献 = +funding_total
+        #   funding_total < 0 (净收款) → ed 增 → (vec - ed) 减 → 贡献 = +funding_total（负值）
+        # → funding_delta = +total_funding_rate（v6 唯一 sign flip）
+        funding_delta = +total_funding_rate
         rows.append({
             "bias_source": _BIAS_FUNDING,
             "delta_terminal_return": funding_delta,

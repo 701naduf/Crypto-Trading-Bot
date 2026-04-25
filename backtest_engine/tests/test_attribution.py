@@ -211,13 +211,16 @@ class TestDeviationAttribution:
         assert not np.isnan(total_row["delta_sharpe"])
 
     def test_funding_first_order_approx(self):
-        """funding 一阶：delta = -total_funding_rate"""
+        """funding 一阶（vec-ed 约定，Step 3 修订）：delta = +total_funding_rate
+
+        funding_total = -0.002（净收款）→ ed 增 → vec - ed 减 → delta = +(-0.002) = -0.002
+        """
         ed_report = _make_dummy_report(funding_total=-0.002)
         vec_result = _make_synthetic_result(seed=1)
         df = deviation_attribution(ed_report, vec_result)
         funding_row = df.loc[df["bias_source"] == "funding 事件"].iloc[0]
-        # 去掉 funding（funding_total=-0.002 表示净收款）→ 增加 +0.002
-        assert np.isclose(funding_row["delta_terminal_return"], 0.002, rtol=1e-12)
+        # vec-ed 约定下 funding_delta = +funding_total（v6 sign flip）
+        assert np.isclose(funding_row["delta_terminal_return"], -0.002, rtol=1e-12)
         assert funding_row["method"] == "first_order_approx"
 
     def test_skip_optimize_n_when_eq_1(self):
@@ -456,3 +459,137 @@ class TestComputePerSymbolCost:
         # bar 2: V_prev = V[1]；A=10000, B=100000 → impact 与 √V 成正比 → ratio=√10
         ratio = per_b["impact"].iloc[2, 0] / per_a["impact"].iloc[2, 0]
         assert np.isclose(ratio, np.sqrt(10), rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Step 3 (A2/Z1/Z7/Z9): vec-ed P2 残差测试
+# ---------------------------------------------------------------------------
+
+def _make_pair_with_funding_offset(
+    funding_total: float, vec_seed: int = 1, n: int = 100,
+) -> tuple[BacktestResult, BacktestReport, BacktestResult]:
+    """Z1 helper（含 Z7 物理正确 + Z9 returns/equity 自洽 + O7 措辞精度）
+
+    保证（物理符号正确，Z7）：
+      sign(ed_term - vec_term) = sign(-funding_total)
+      （funding_total > 0 扣款 → ed < vec；funding_total < 0 收款 → ed > vec）
+
+    保证（returns / equity_curve 严格自洽，Z9）：
+      ed.equity_curve = (1 + ed.returns).cumprod() × V_initial   严格相等
+
+    数值精度（O7）:
+      ed_term ≈ vec_term - funding_total（首阶 magnitude）
+      二阶 compounding 误差 ~funding_total × vec_term ~ 1e-4
+      （非严格 = -funding_total，但 residual=0 by construction symmetry，
+        不依赖 ed_term 具体值）
+    """
+    vec = _make_synthetic_result(n=n, seed=vec_seed)
+
+    # Z9: 让 ed.returns 末值偏移 -funding_total，cumprod 自然给出对的 equity_curve
+    ed_returns = vec.returns.copy()
+    ed_returns.iloc[-1] = ed_returns.iloc[-1] - funding_total   # Z7: 物理正确符号
+    ed_equity = (1 + ed_returns).cumprod() * vec.equity_curve.iloc[0]
+
+    ed_base = BacktestResult(
+        equity_curve=ed_equity,
+        returns=ed_returns,                    # Z9: 与 equity_curve 自洽
+        turnover=vec.turnover.copy(),
+        weights_history=vec.weights_history.copy(),
+        gross_returns=vec.gross_returns.copy() if vec.gross_returns is not None else None,
+        total_cost=0.0,
+    )
+    cfg = BacktestConfig(
+        strategy_name="t",
+        symbols=["BTC/USDT"],
+        start=pd.Timestamp("2024-01-01", tz="UTC"),
+        end=pd.Timestamp("2024-02-01", tz="UTC"),
+        run_mode=RunMode.EVENT_DRIVEN_DYNAMIC_COST,
+        constraints=__import__("alpha_model").core.types.PortfolioConstraints(),
+    )
+    ed_report = BacktestReport(
+        base=ed_base, config=cfg,
+        cost_breakdown={"absolute": {}, "annualized_bp": {}, "share": {}},
+        deviation=None, regime_stats=None,
+        funding_settlements={
+            "n_events": 1, "total_rate": funding_total,
+            "mean_rate_per_event": funding_total,
+            "first_event": vec.equity_curve.index[0],
+            "last_event": vec.equity_curve.index[-1],
+        },
+        bankruptcy_timestamp=None,
+        run_metadata={
+            "run_mode": cfg.run_mode.value, "cost_mode": "full_cost",
+            "execution_mode": "market", "start": cfg.start, "end": cfg.end,
+            "n_bars": n, "n_bars_planned": n,
+            "walltime_seconds": 1.0, "schema_version": SCHEMA_VERSION,
+        },
+    )
+
+    # abl_funding: 关掉 funding → equity_curve 等于 vec
+    abl_funding = BacktestResult(
+        equity_curve=vec.equity_curve.copy(),
+        returns=vec.returns.copy(),
+        turnover=vec.turnover.copy(),
+        weights_history=vec.weights_history.copy(),
+        gross_returns=vec.gross_returns.copy() if vec.gross_returns is not None else None,
+        total_cost=0.0,
+    )
+    return vec, ed_report, abl_funding
+
+
+class TestDeviationP2ResidualZero:
+    """Z1 + Z7: P2 path 单一 funding 偏差 + 哨兵零变化 ablation：残差 ≈ 0 (rtol=1e-12)"""
+
+    def test_residual_zero_net_received(self):
+        """Case 1: funding_total = -0.002（净收款，ed > vec）"""
+        vec, ed_report, abl_funding = _make_pair_with_funding_offset(
+            funding_total=-0.002, vec_seed=1, n=100,
+        )
+        # 物理验证（Z7）：净收款下 ed > vec
+        ed_term = ed_report.base.equity_curve.iloc[-1] / ed_report.base.equity_curve.iloc[0] - 1
+        vec_term = vec.equity_curve.iloc[-1] / vec.equity_curve.iloc[0] - 1
+        assert ed_term > vec_term, "Z7: 净收款下 ed_term 应 > vec_term"
+
+        df = deviation_attribution(
+            ed_report, vec,
+            ablation_results={
+                "funding": abl_funding,
+                "min_trade_value": ed_report.base,    # 哨兵零变化（Option A）
+            },
+        )
+        residual_row = df[df["bias_source"] == "未归因残差"]
+        assert len(residual_row) == 1, "残差行未生成"
+        assert abs(residual_row["delta_terminal_return"].iloc[0]) < 1e-12
+
+    def test_residual_zero_funding_charge(self):
+        """Case 2: funding_total = +0.001（扣款，ed < vec）"""
+        vec, ed_report, abl_funding = _make_pair_with_funding_offset(
+            funding_total=+0.001, vec_seed=2, n=100,
+        )
+        # 物理验证（Z7）：扣款下 ed < vec
+        ed_term = ed_report.base.equity_curve.iloc[-1] / ed_report.base.equity_curve.iloc[0] - 1
+        vec_term = vec.equity_curve.iloc[-1] / vec.equity_curve.iloc[0] - 1
+        assert ed_term < vec_term, "Z7: 扣款下 ed_term 应 < vec_term"
+
+        df = deviation_attribution(
+            ed_report, vec,
+            ablation_results={
+                "funding": abl_funding,
+                "min_trade_value": ed_report.base,
+            },
+        )
+        residual_row = df[df["bias_source"] == "未归因残差"]
+        assert len(residual_row) == 1
+        assert abs(residual_row["delta_terminal_return"].iloc[0]) < 1e-12
+
+    def test_helper_equity_curve_self_consistent(self):
+        """Z9: helper 构造的 ed.equity_curve == (1+ed.returns).cumprod() × V_initial"""
+        vec, ed_report, _ = _make_pair_with_funding_offset(
+            funding_total=-0.002, vec_seed=1, n=100,
+        )
+        ed_base = ed_report.base
+        V_initial = vec.equity_curve.iloc[0]
+        reconstructed = (1 + ed_base.returns).cumprod() * V_initial
+        np.testing.assert_allclose(
+            ed_base.equity_curve.values, reconstructed.values, rtol=1e-12,
+        )
