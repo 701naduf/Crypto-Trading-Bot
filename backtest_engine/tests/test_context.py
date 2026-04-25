@@ -253,3 +253,76 @@ class TestInvariants:
         # build_panels / build 应仍能工作
         panels = builder.build_panels()
         assert len(panels) == 4
+
+
+# ---------------------------------------------------------------------------
+# Step 7 (B2/O4): spread 取 bar_close 时点
+# ---------------------------------------------------------------------------
+
+class TestStep7SpreadBarCloseTimestamp:
+    """
+    B2: spread 取 bar_close 时点（bar_open + bar_freq）而非 bar_open
+    O4: self._end 边界处 query_ts > end，超 max_gap 时返回 NaN
+    """
+
+    def test_snapshot_to_bar_close_offset(self):
+        """单元测试 _snapshot_to_bar：close_offset=1min 时取 bar_close 之前最近一条"""
+        from backtest_engine.context import MarketContextBuilder
+
+        # 构造 orderbook 仅在每个 bar 内 t+30s 时点有快照（bar_open 时刻无）
+        # bar_open: 12:00, 12:01；snap: 12:00:30, 12:01:30
+        bar_index = pd.DatetimeIndex([
+            pd.Timestamp("2024-01-01 12:00:00", tz="UTC"),
+            pd.Timestamp("2024-01-01 12:01:00", tz="UTC"),
+        ])
+        snap_ts = pd.DatetimeIndex([
+            pd.Timestamp("2024-01-01 12:00:30", tz="UTC"),
+            pd.Timestamp("2024-01-01 12:01:30", tz="UTC"),
+        ])
+        snap = pd.Series([0.001, 0.002], index=snap_ts)
+
+        # 旧行为（无 close_offset）：query at bar_open → bar_open 之前 30s 无快照 → NaN
+        result_no_offset = MarketContextBuilder._snapshot_to_bar(
+            snap, bar_index, max_gap=pd.Timedelta(seconds=10),
+        )
+        # bar 0 (12:00:00): backward asof tolerance=10s → 12:00:30 在 future → NaN
+        # bar 1 (12:01:00): backward asof → 12:00:30 在 30s 之前，超 10s tolerance → NaN
+        assert pd.isna(result_no_offset.iloc[0])
+        assert pd.isna(result_no_offset.iloc[1])
+
+        # 新行为（close_offset=1min）：query at bar_close (12:01:00, 12:02:00)
+        # → bar 0 (12:01:00): 12:00:30 在 30s 之前，超 10s tolerance → NaN
+        # → bar 1 (12:02:00): 12:01:30 在 30s 之前，超 10s tolerance → NaN
+        # 调大 tolerance：让 close_offset 时点能取到快照
+        result_with_offset = MarketContextBuilder._snapshot_to_bar(
+            snap, bar_index, max_gap=pd.Timedelta(seconds=45),
+            close_offset=pd.Timedelta(minutes=1),
+        )
+        # bar 0 (close=12:01:00): 12:00:30 在 30s 之前，<= 45s → 取到 0.001
+        # bar 1 (close=12:02:00): 12:01:30 在 30s 之前，<= 45s → 取到 0.002
+        assert np.isclose(result_with_offset.iloc[0], 0.001)
+        assert np.isclose(result_with_offset.iloc[1], 0.002)
+
+    def test_period_end_boundary(self):
+        """O4: self._end 处 query_ts > end，超 max_gap 时返回 NaN"""
+        from backtest_engine.context import MarketContextBuilder
+
+        # bar_index 末尾贴近 end；orderbook 最后一条在 end - 100s
+        bar_index = pd.DatetimeIndex([
+            pd.Timestamp("2024-01-01 12:00:00", tz="UTC"),
+            pd.Timestamp("2024-01-01 12:01:00", tz="UTC"),  # ★ 末尾 bar
+        ])
+        # 最后一条快照在末尾 bar_close (12:02:00) 之前 100 秒 = 12:00:20
+        snap = pd.Series(
+            [0.001],
+            index=pd.DatetimeIndex([pd.Timestamp("2024-01-01 12:00:20", tz="UTC")]),
+        )
+        # max_gap=30s + close_offset=1min:
+        # bar 0 query=12:01:00, snap=12:00:20, gap=40s > 30s → NaN
+        # bar 1 query=12:02:00, snap=12:00:20, gap=100s > 30s → NaN
+        result = MarketContextBuilder._snapshot_to_bar(
+            snap, bar_index, max_gap=pd.Timedelta(seconds=30),
+            close_offset=pd.Timedelta(minutes=1),
+        )
+        assert pd.isna(result.iloc[0])
+        assert pd.isna(result.iloc[1])

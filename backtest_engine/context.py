@@ -233,9 +233,13 @@ class MarketContextBuilder:
             spread_raw = (ob["ask_price_0"] - ob["bid_price_0"]) / mid
             spread_raw = spread_raw.dropna().sort_index()
 
-            # merge_asof 取 bar_close 之前最近一条快照，tolerance 控制 max_gap
+            # Step 7 / B2: 仅 spread 用 bar_close 偏移
+            # 设计 §11.2.5 + §八.8 / E.1: t 时刻语义 = bar_close（bar_open + bar_freq）
+            # 取 bar_close 之前最近一条快照，tolerance 控制 max_gap
+            close_offset = pd.Timedelta(_to_pd_freq(self._bar_freq))
             spread_aligned = self._snapshot_to_bar(
                 spread_raw, self._full_bar_index, max_gap,
+                close_offset=close_offset,
             )
             cols[sym] = spread_aligned
 
@@ -246,20 +250,29 @@ class MarketContextBuilder:
         snapshot_series: pd.Series,
         bar_index: pd.DatetimeIndex,
         max_gap: pd.Timedelta,
+        close_offset: pd.Timedelta | None = None,
     ) -> pd.Series:
         """
         把高频快照对齐到 bar 网格：取 bar_t 之前最近一条；gap 超过 max_gap 时返回 NaN。
+
+        Args:
+            close_offset: Step 7 / B2 / Q3：仅 spread 传入；查询时点 = bar_index + offset
+                          （bar_close 时刻）。其他面板（vol/adv/funding/price）不用此偏移。
+                          None 时退化为旧行为（用 bar_index 直接查询）。
 
         实现：merge_asof(direction='backward', tolerance=max_gap)。
         """
         if len(snapshot_series) == 0:
             return pd.Series(np.nan, index=bar_index, dtype=float)
 
+        # Step 7: 仅 spread 偏移到 bar_close（bar_open + bar_freq）
+        query_ts = bar_index if close_offset is None else (bar_index + close_offset)
+
         snap_df = pd.DataFrame({
             "ts": snapshot_series.index,
             "value": snapshot_series.values,
         }).sort_values("ts")
-        bar_df = pd.DataFrame({"ts": bar_index}).sort_values("ts")
+        bar_df = pd.DataFrame({"ts": query_ts}).sort_values("ts")
 
         merged = pd.merge_asof(
             bar_df, snap_df, on="ts",
@@ -267,7 +280,13 @@ class MarketContextBuilder:
             tolerance=max_gap,
             allow_exact_matches=True,
         )
-        return pd.Series(merged["value"].values, index=bar_index, dtype=float)
+        # 返回值仍以 bar_index（bar_open）为 index，方便面板对齐
+        # 注意：merged 已被 sort_values("ts") 排序，需要 reorder 回 bar_index 顺序
+        merged_indexed = pd.Series(merged["value"].values, index=query_ts)
+        return pd.Series(
+            merged_indexed.reindex(query_ts).values,
+            index=bar_index, dtype=float,
+        )
 
     def _load_funding_panel(self, reader: "DataReader") -> pd.DataFrame:
         """
