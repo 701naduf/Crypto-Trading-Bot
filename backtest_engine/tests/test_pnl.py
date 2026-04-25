@@ -346,11 +346,13 @@ class TestZeroFrictionMatchesVectorized:
         # 所以比较时归一化
         vec_eq = vec_result.equity_curve / vec_result.equity_curve.iloc[0]
         ed_eq = ed_result.equity_curve / ed_result.equity_curve.iloc[0]
-        # 两者 returns 应一致
-        # 注意：vectorized 的 portfolio_gross 在 t=0 是 NaN，pct_change 自然
-        common = vec_result.returns.dropna().index.intersection(ed_result.returns.index)
+        # N4 (v3 修订): 改 iloc[1:] 让中间任何 NaN 严格暴露（替代旧的 fillna(0) 兜底）
+        # vec_result.returns.iloc[0] 是 NaN（pct_change 首行），用 iloc[1:] 跳过
+        common = vec_result.returns.iloc[1:].dropna().index.intersection(
+            ed_result.returns.iloc[1:].index
+        )
         pd.testing.assert_series_equal(
-            vec_result.returns.loc[common].fillna(0.0),
+            vec_result.returns.loc[common],
             ed_result.returns.loc[common],
             rtol=1e-10, check_names=False, check_freq=False,
         )
@@ -377,3 +379,67 @@ class TestBacktestResultSchema:
         assert isinstance(result.equity_curve, pd.Series)
         assert isinstance(result.weights_history, pd.DataFrame)
         assert isinstance(result.gross_returns, pd.Series)
+
+
+# ---------------------------------------------------------------------------
+# Step 2 (A1/N1): NaN 静默吃掉防御 + funding NaN warning
+# ---------------------------------------------------------------------------
+
+class TestStep2NaNDefense:
+    """A1: sum(skipna=False) 让 price NaN → V NaN → NumericalError；
+       N1: funding_rates 含 NaN → silent fillna(0) + logger.warning（不中断）"""
+
+    def test_record_raises_on_price_nan(self):
+        """A1: price NaN 通过 returns/(prev_w*returns).sum(skipna=False) → V NaN → NumericalError"""
+        import numpy as np
+        symbols = ["BTC/USDT", "ETH/USDT"]
+        ts = pd.date_range("2024-01-01", periods=2, freq="1min", tz="UTC")
+        tracker = PnLTracker(10000.0)
+        # bar 0: 建仓
+        tracker.record(
+            ts[0], pd.Series([0.5, 0.3], index=symbols),
+            pd.Series([100.0, 200.0], index=symbols),
+            _zero_exec_report(symbols, ts[0]),
+        )
+        # bar 1: ETH price NaN（其他正常）→ 旧实现 sum(skipna=True) 静默吃 NaN，V 不变 finite
+        # → 新实现 sum(skipna=False) 让 V = NaN → NumericalError
+        with pytest.raises(NumericalError, match="V"):
+            tracker.record(
+                ts[1], pd.Series([0.5, 0.3], index=symbols),
+                pd.Series([101.0, np.nan], index=symbols),
+                _zero_exec_report(symbols, ts[1]),
+            )
+
+    def test_funding_settlement_handles_nan_rate(self):
+        """N1: funding_rates 含 NaN（数据 gap）→ 视为 0；V 仍 finite，不抛异常"""
+        import numpy as np
+        symbols = ["BTC/USDT", "ETH/USDT"]
+        t = pd.Timestamp("2024-01-01 08:00", tz="UTC")
+        tracker = PnLTracker(10000.0)
+        cw = pd.Series([0.5, 0.3], index=symbols)
+        # ETH funding 缺数据
+        rates = pd.Series([0.0001, np.nan], index=symbols)
+        tracker.apply_funding_settlement(t, cw, rates)
+        # 不抛；funding_total = 0.5 × 0.0001 + 0.3 × 0 = 5e-5（ETH NaN 视为 0）
+        import numpy as np
+        np.testing.assert_allclose(
+            tracker.funding_events.iloc[0], 0.5 * 0.0001, rtol=1e-12,
+        )
+        assert np.isfinite(tracker.portfolio_value)
+
+    def test_funding_settlement_warns_on_nan(self, caplog):
+        """N1-warning: funding_rates 含 NaN 时 logger.warning（不静默）"""
+        import logging
+        import numpy as np
+        symbols = ["BTC/USDT", "ETH/USDT"]
+        t = pd.Timestamp("2024-01-01 08:00", tz="UTC")
+        tracker = PnLTracker(10000.0)
+        cw = pd.Series([0.5, 0.3], index=symbols)
+        rates = pd.Series([0.0001, np.nan], index=symbols)
+        with caplog.at_level(logging.WARNING):
+            tracker.apply_funding_settlement(t, cw, rates)
+        # warning 触发，含"funding_rates 含 NaN"
+        assert any(
+            "funding_rates 含 NaN" in r.message and "ETH" in r.message
+            for r in caplog.records
+        )

@@ -114,11 +114,22 @@ class PnLTracker:
         # （正常情况下 record 末尾已重置 _v_before_funding == _V，但显式覆盖保证 invariant）
         self._v_before_funding = self._V
 
-        # 对齐 weights 与 rates 到相同 index
-        aligned_w = current_weights.reindex(funding_rates.index).fillna(0.0).astype(float)
-        aligned_rates = funding_rates.astype(float)
+        # N1-warning（v3）：检测 NaN 时显式警告，避免静默兜底掩盖上游数据 gap
+        if funding_rates.isna().any():
+            nan_syms = list(funding_rates.index[funding_rates.isna()])
+            logger.warning(
+                "apply_funding_settlement: funding_rates 含 NaN（symbols: %s），已视为 0；"
+                "可能是上游数据 gap，请检查 DataReader.get_funding_rate 输出",
+                nan_syms,
+            )
 
-        funding_rate_total = float((aligned_w * aligned_rates).sum())
+        # 对齐 weights 与 rates 到相同 index
+        # N1（v3）：显式 fillna(0) 视为"该 symbol 无 funding 数据 = 该 symbol 无 funding 事件"，
+        # 不依赖 pandas 默认 skipna 行为；sum(skipna=False) 让任何意外 NaN（aligned_w 残留）暴露
+        aligned_w = current_weights.reindex(funding_rates.index).fillna(0.0).astype(float)
+        aligned_rates = funding_rates.fillna(0.0).astype(float)
+
+        funding_rate_total = float((aligned_w * aligned_rates).sum(skipna=False))
         self._V *= (1.0 - funding_rate_total)
         self._funding_events[t] = funding_rate_total
         self._funding_applied_at_t = t
@@ -142,7 +153,9 @@ class PnLTracker:
             prev_price = self._prev_price.reindex(common_syms)
             curr_price = price_at_t.reindex(common_syms)
             returns = curr_price / prev_price - 1.0
-            gross_rate = float((self._prev_actual_w * returns).sum())
+            # A1（v3）：sum(skipna=False) 让 price NaN → returns NaN → gross NaN → V NaN
+            # → _check_bankruptcy 抛 NumericalError；防"NaN 被默认 skipna 静默吃为 0" silent error
+            gross_rate = float((self._prev_actual_w * returns).sum(skipna=False))
 
         # ── Step 2: 本步 cost rate ──
         cost_rate = (
@@ -242,10 +255,14 @@ class PnLTracker:
         # 向量化算 gross
         # 对齐 price_panel 到 weights_history 的 index + columns
         prices = price_panel.reindex(idx)[list(symbols)]
-        returns = prices.pct_change().fillna(0.0)
-        # shift(1) 后第一行 NaN，用 0 填（首 bar gross == 0，与 record() 一致）
-        shifted_w = weights_df.shift(1).fillna(0.0)
-        gross_series = (shifted_w * returns).sum(axis=1)
+        # A1（v3）：returns 不全 fillna(0)；首 bar 的 NaN（pct_change 首行）单独 = 0；
+        # 其他 NaN（来自 price 数据 gap）保留 → sum(skipna=False) 让 NaN 暴露
+        returns = prices.pct_change()
+        if len(returns) > 0:
+            returns.iloc[0] = 0.0
+        # shift(1, fill_value=0.0) 让首行用 0（精确语义，不靠 fillna）
+        shifted_w = weights_df.shift(1, fill_value=0.0)
+        gross_series = (shifted_w * returns).sum(axis=1, skipna=False)
 
         # 成本 + funding
         fee_s = pd.Series(self._fee_series).reindex(idx, fill_value=0.0)
