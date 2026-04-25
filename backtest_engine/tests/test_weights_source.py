@@ -150,6 +150,13 @@ class TestPrecomputedWeights:
         with pytest.raises(ValueError, match="DatetimeIndex"):
             PrecomputedWeights(panel)
 
+    def test_naive_index_raises(self):
+        """Step 13 / C3: naive DatetimeIndex 必须被拒绝（防静默漏匹配）"""
+        idx = pd.date_range("2024-01-01", periods=3, freq="1min")   # 无 tz
+        panel = pd.DataFrame({"BTC/USDT": [0.1, 0.2, 0.3]}, index=idx)
+        with pytest.raises(ValueError, match="tz-aware"):
+            PrecomputedWeights(panel)
+
     def test_multiindex_columns_rejected(self):
         idx = pd.date_range("2024-01-01", periods=3, freq="1min", tz="UTC")
         cols = pd.MultiIndex.from_tuples([("BTC", "x"), ("BTC", "y")])

@@ -84,6 +84,12 @@ class PrecomputedWeights:
             raise ValueError(
                 f"weights_panel.index 必须是 DatetimeIndex，收到 {type(panel.index).__name__}"
             )
+        # Step 13 / C3: tz-aware 校验（防 naive index 与 tz-aware bar_timestamps 静默漏匹配）
+        if panel.index.tz is None:
+            raise ValueError(
+                "weights_panel.index 必须 tz-aware（推荐 tz='UTC'）；"
+                "naive index 与 tz-aware bar_timestamps 比较会静默漏匹配 → KeyError or 漏 bar"
+            )
         if not panel.index.is_unique:
             raise ValueError("weights_panel.index 必须 unique（不允许重复 timestamp）")
         if isinstance(panel.columns, pd.MultiIndex):
