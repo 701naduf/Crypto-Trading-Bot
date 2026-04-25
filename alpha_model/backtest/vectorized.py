@@ -109,6 +109,7 @@ def vectorized_backtest(
     impact_coeff: float = DEFAULT_IMPACT_COEFF,
     adv_panel: pd.DataFrame | None = None,
     spread_panel: pd.DataFrame | None = None,
+    vol_panel: pd.DataFrame | None = None,
     portfolio_value: float = DEFAULT_PORTFOLIO_VALUE,
     periods_per_year: float = MINUTES_PER_YEAR,
 ) -> BacktestResult:
@@ -135,6 +136,14 @@ def vectorized_backtest(
                           None 则退化为纯手续费模型（无市场冲击）
         spread_panel:     买卖价差面板 (timestamp × symbol)，比率形式 (ask-bid)/mid
                           None 则不计入价差成本（默认，向后兼容 Phase 2b 旧行为）
+        vol_panel:        日化 σ 面板 (timestamp × symbol)。
+                          - None（默认）：内部用 rolling(60, min_periods=10).std()
+                            × √bars_per_day 估算 60-min σ
+                          - 非 None：尊重外部 σ，跳过内部计算（用于 Phase 3 跨模式
+                            σ 一致性，避免 vectorized 60-min σ 与事件驱动模式
+                            20-day σ 不一致）
+                          ⚠️ 两种用法窗口长度差 1-2 个数量级，impact 估计随之差
+                             √480 ≈ 22 倍。用户应在同一回测内一致用法。
         portfolio_value:  组合总资金（用于将权重转为实际交易金额）
         periods_per_year: 年化系数。默认 `MINUTES_PER_YEAR` (525960) 对应 1m bar。
                           内部用于把 bar 级波动率转为 impact 公式所需的**日化** σ
@@ -177,14 +186,18 @@ def vectorized_backtest(
     # 3. 市场冲击（如果提供了 ADV）
     impact_cost = pd.Series(0.0, index=common_idx)
     if adv_panel is not None:
-        # 滚动波动率（60 bar），**日化** σ，与 Almgren-Chriss 约定配套
-        # bars_per_day 由 periods_per_year 推导：1m→1440, 5m→288, 1h→24
-        bars_per_day = periods_per_year / 365.25
-        vol_panel = returns_panel.rolling(60, min_periods=10).std() * np.sqrt(bars_per_day)
+        # σ 来源：传入则用外部 vol_panel（Phase 3 跨模式一致性），否则内部估算 60-min σ
+        if vol_panel is not None:
+            vol = vol_panel.reindex(common_idx)[symbols]
+        else:
+            # 滚动波动率（60 bar），**日化** σ，与 Almgren-Chriss 约定配套
+            # bars_per_day 由 periods_per_year 推导：1m→1440, 5m→288, 1h→24
+            bars_per_day = periods_per_year / 365.25
+            vol = returns_panel.rolling(60, min_periods=10).std() * np.sqrt(bars_per_day)
         adv_aligned = adv_panel.reindex(common_idx)[symbols]
 
         impact = estimate_market_impact(
-            delta_w, adv_aligned, vol_panel,
+            delta_w, adv_aligned, vol,
             portfolio_value, impact_coeff,
         )
         impact_cost = impact.sum(axis=1)

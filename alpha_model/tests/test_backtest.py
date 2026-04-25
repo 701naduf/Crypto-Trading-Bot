@@ -591,3 +591,66 @@ class TestVectorizedSpreadPanel:
         expected_all = result_fee_only.total_cost + spread_contribution + impact_contribution
 
         np.testing.assert_allclose(result_all.total_cost, expected_all, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Step 0a (Q2 / C5): vectorized_backtest 新增 vol_panel kwarg
+# ---------------------------------------------------------------------------
+
+class TestVectorizedVolPanelKwarg:
+    """vectorized_backtest 接受外部 vol_panel 跳过内部 60-min σ 计算"""
+
+    def _make_setup(self, n=300, seed=0):
+        rng = np.random.RandomState(seed)
+        symbols = ["BTC/USDT", "ETH/USDT"]
+        prices = _make_price_panel(n_rows=n, symbols=symbols, seed=seed)
+        weights = pd.DataFrame(
+            rng.uniform(-0.3, 0.3, (n, 2)),
+            index=prices.index, columns=symbols,
+        )
+        adv = pd.DataFrame(
+            np.full((n, 2), 1e9), index=prices.index, columns=symbols,
+        )
+        return weights, prices, adv
+
+    def test_vol_panel_default_none_unchanged(self):
+        """不传 vol_panel 与扩展前数值一致（向后兼容）"""
+        weights, prices, adv = self._make_setup()
+        # 显式传 None 与省略一致
+        r1 = vectorized_backtest(
+            weights, prices, fee_rate=0.0004, impact_coeff=0.1,
+            adv_panel=adv, portfolio_value=10000.0,
+        )
+        r2 = vectorized_backtest(
+            weights, prices, fee_rate=0.0004, impact_coeff=0.1,
+            adv_panel=adv, vol_panel=None, portfolio_value=10000.0,
+        )
+        np.testing.assert_allclose(
+            r1.equity_curve.values, r2.equity_curve.values, rtol=1e-12,
+        )
+        np.testing.assert_allclose(r1.total_cost, r2.total_cost, rtol=1e-12)
+
+    def test_vol_panel_overrides_internal(self):
+        """传入 vol_panel = 内部 σ × 4 → impact 精确放大 4 倍"""
+        weights, prices, adv = self._make_setup()
+
+        # 跑一次拿内部 σ（间接：通过 impact 推算）
+        r_default = vectorized_backtest(
+            weights, prices, fee_rate=0.0, impact_coeff=0.1,
+            adv_panel=adv, portfolio_value=10000.0,
+        )
+        # 显式构造内部 σ 公式
+        returns = prices.pct_change()
+        bars_per_day = 525960 / 365.25
+        internal_vol = returns.rolling(60, min_periods=10).std() * np.sqrt(bars_per_day)
+
+        # 传 vol_panel = internal_vol × 4 → impact ∝ σ → impact × 4
+        scaled_vol = internal_vol * 4.0
+        r_scaled = vectorized_backtest(
+            weights, prices, fee_rate=0.0, impact_coeff=0.1,
+            adv_panel=adv, vol_panel=scaled_vol, portfolio_value=10000.0,
+        )
+
+        # 两 result 对应的 impact = total_cost (fee=0 隔离)
+        ratio = r_scaled.total_cost / r_default.total_cost
+        np.testing.assert_allclose(ratio, 4.0, rtol=1e-10)
