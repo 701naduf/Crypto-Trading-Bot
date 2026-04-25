@@ -170,7 +170,7 @@ def deviation_attribution(
 
     # ── min_trade_value 过滤 ──
     if "min_trade_value" in ablations:
-        delta = _ablation_delta(ablations["min_trade_value"], base)
+        delta = _ablation_delta(ablations["min_trade_value"], base, cfg.periods_per_year)
         rows.append({
             "bias_source": _BIAS_MIN_TRADE,
             "delta_terminal_return": delta["terminal"],
@@ -191,7 +191,7 @@ def deviation_attribution(
 
     # ── funding（默认 first-order 近似量化）──
     if "funding" in ablations:
-        delta = _ablation_delta(ablations["funding"], base)
+        delta = _ablation_delta(ablations["funding"], base, cfg.periods_per_year)
         rows.append({
             "bias_source": _BIAS_FUNDING,
             "delta_terminal_return": delta["terminal"],
@@ -223,7 +223,7 @@ def deviation_attribution(
 
     # ── 动态 V 更新（impact 偏差）──
     if "dynamic_v" in ablations:
-        delta = _ablation_delta(ablations["dynamic_v"], base)
+        delta = _ablation_delta(ablations["dynamic_v"], base, cfg.periods_per_year)
         rows.append({
             "bias_source": _BIAS_DYNAMIC_V,
             "delta_terminal_return": delta["terminal"],
@@ -246,7 +246,7 @@ def deviation_attribution(
     if cfg.optimize_every_n_bars > 1:
         bias_name = _BIAS_OPTIMIZE_N.format(cfg.optimize_every_n_bars)
         if "optimize_every_n_bars" in ablations:
-            delta = _ablation_delta(ablations["optimize_every_n_bars"], base)
+            delta = _ablation_delta(ablations["optimize_every_n_bars"], base, cfg.periods_per_year)
             rows.append({
                 "bias_source": bias_name,
                 "delta_terminal_return": delta["terminal"],
@@ -316,16 +316,22 @@ def deviation_attribution(
 
 def _ablation_delta(
     ablation_result: BacktestResult, base: BacktestResult,
+    periods_per_year: float,
 ) -> dict[str, float]:
-    """计算 ablation 与 base 的 terminal/sharpe 差"""
+    """计算 ablation 与 base 的 terminal/sharpe 差
+
+    B5 (Step 10): periods_per_year 显式参数透传给 BacktestResult.summary，
+    与主路径 (line 164-165) 用 cfg.periods_per_year 一致；
+    避免 ablation sharpe 用默认 MINUTES_PER_YEAR 而 ed/vec sharpe 用 cfg 值的不一致。
+    """
     abl_term = float(
         ablation_result.equity_curve.iloc[-1] / ablation_result.equity_curve.iloc[0] - 1.0
     )
     base_term = float(
         base.equity_curve.iloc[-1] / base.equity_curve.iloc[0] - 1.0
     )
-    abl_sharpe = ablation_result.summary()["sharpe_ratio"]
-    base_sharpe = base.summary()["sharpe_ratio"]
+    abl_sharpe = ablation_result.summary(periods_per_year=periods_per_year)["sharpe_ratio"]
+    base_sharpe = base.summary(periods_per_year=periods_per_year)["sharpe_ratio"]
     return {
         "terminal": abl_term - base_term,
         "sharpe": abl_sharpe - base_sharpe,
