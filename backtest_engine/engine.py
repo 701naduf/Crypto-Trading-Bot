@@ -38,6 +38,21 @@ from backtest_engine.config import (
     BacktestConfig, RunMode, ExecutionMode, CostMode,
 )
 from backtest_engine.context import MarketContextBuilder, _to_pd_freq
+
+
+def _normalize_freq(s: str | None) -> str | None:
+    """归一化 pd freq 字符串：'min' / '1min' / '1T' 都 → 'min' (M3)
+
+    pandas 2.2+ 下 pd.infer_freq() 返回 'min'，但 _to_pd_freq("1m") 返回 '1min'，
+    字面比较会误报不一致。to_offset(...).freqstr 双侧归一化解决此问题。
+    """
+    if s is None:
+        return None
+    try:
+        from pandas.tseries.frequencies import to_offset
+        return to_offset(s).freqstr
+    except (ValueError, TypeError):
+        return None
 from backtest_engine.pnl import PnLTracker
 from backtest_engine.rebalancer import Rebalancer
 from backtest_engine.report import BacktestReport, SCHEMA_VERSION
@@ -157,6 +172,9 @@ class EventDrivenBacktester:
 
         # 7. price_panel.index ⊇ bar_timestamps（v3 修订）
         # 简化校验：只要 reader 能读到任一 symbol 的数据即可
+        # Step 6 / B1 / M3：同时做 #8 freq 推断校验（用 to_offset 归一化避免 'min' vs '1min' 误报）
+        from pandas.tseries.frequencies import to_offset
+        expected_freq = _normalize_freq(pd_freq)
         for sym in config.symbols:
             df = reader.get_ohlcv(sym, config.bar_freq, start=config.start, end=config.end)
             if df is None or len(df) == 0:
@@ -174,6 +192,18 @@ class EventDrivenBacktester:
                     f"{sym} price 缺 {len(missing_bars)} 个 bar（前 5: "
                     f"{missing_bars[:5].tolist()}）；compute_backtest_result 时会含 NaN"
                 )
+
+            # 8. price_panel.index.freq 与 config.bar_freq 归一化后一致
+            # （reviewer M3：'min' 与 '1min' 在 pandas 2.x 下用 to_offset 归一化才能正确比较）
+            sample = data_ts[:100] if len(data_ts) > 100 else data_ts
+            if len(sample) >= 3:    # infer_freq 至少需 3 个点
+                inferred = _normalize_freq(pd.infer_freq(sample))
+                if inferred is not None and expected_freq is not None and inferred != expected_freq:
+                    raise ValueError(
+                        f"{sym} price 推断频率 {inferred} ≠ config.bar_freq "
+                        f"{expected_freq}（{config.bar_freq}）；"
+                        f"impact 公式的 bars_per_day 会算错"
+                    )
 
         # 5. funding_rate 数据覆盖（仅 DYNAMIC_COST 严格要求）
         if config.run_mode == RunMode.EVENT_DRIVEN_DYNAMIC_COST:
