@@ -100,8 +100,8 @@ class MarketContextBuilder:
             len(self._symbols), len(self._full_bar_index), lookback_days,
         )
 
-        self._price_panel = self._load_price_panel(reader)
-        self._volume_panel = self._load_volume_panel(reader)
+        # Step 11 / C1: 单次循环读完 OHLCV，分离 close + volume，避免重复 IO
+        self._price_panel, self._volume_panel = self._load_ohlcv_panels(reader)
 
         # vol / ADV 面板（基于 OHLCV）
         self._vol_panel = self._compute_vol_panel(self._price_panel)
@@ -126,10 +126,23 @@ class MarketContextBuilder:
     # 数据加载（私有）
     # ------------------------------------------------------------------
 
-    def _load_price_panel(self, reader: "DataReader") -> pd.DataFrame:
-        """读取每个 symbol 的 close 价，组装为 timestamp × symbol 面板"""
-        cols = {}
+    def _load_ohlcv_panels(
+        self, reader: "DataReader",
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Step 11 / C1: 单次循环读完每个 symbol 的 OHLCV，分离 close + volume。
+
+        v3 之前是两次循环（_load_price_panel + _load_volume_panel）各调一次
+        reader.get_ohlcv，每个 symbol 读两次浪费 IO。Step 11 合并为一次。
+
+        Returns:
+            (price_panel, volume_panel)：均 timestamp × symbol，reindex 到 _full_bar_index。
+            包含热身期校验（数据起点不应晚于 earliest_needed）。
+        """
+        price_cols: dict[str, pd.Series] = {}
+        volume_cols: dict[str, pd.Series] = {}
         earliest_in_data: pd.Timestamp | None = None
+
         for sym in self._symbols:
             df = reader.get_ohlcv(
                 sym, self._bar_freq, start=self._earliest_needed, end=self._end,
@@ -140,12 +153,13 @@ class MarketContextBuilder:
                     f"({self._earliest_needed} ~ {self._end})"
                 )
             df = df.set_index("timestamp") if "timestamp" in df.columns else df
-            cols[sym] = df["close"]
+            price_cols[sym] = df["close"]
+            volume_cols[sym] = df["volume"]
             sym_earliest = df.index.min()
             if earliest_in_data is None or sym_earliest > earliest_in_data:
                 earliest_in_data = sym_earliest
 
-        # 检查热身期是否足够（基于原始数据的最早时间，而非 reindex 后的索引）
+        # 热身期校验
         if earliest_in_data is not None and earliest_in_data > self._earliest_needed:
             raise ValueError(
                 f"价格数据起点 {earliest_in_data} 晚于所需热身期开始 "
@@ -153,23 +167,9 @@ class MarketContextBuilder:
                 f"请增加数据采集或缩短 lookback_days"
             )
 
-        panel = pd.DataFrame(cols)
-        # 索引到全 bar 网格（缺失保留为 NaN，由 rolling 计算/校验自然处理）
-        panel = panel.reindex(self._full_bar_index)
-        return panel
-
-    def _load_volume_panel(self, reader: "DataReader") -> pd.DataFrame:
-        """读取每个 symbol 的 volume（USDT 量纲：close × volume_quote 或直接 volume）"""
-        cols = {}
-        for sym in self._symbols:
-            df = reader.get_ohlcv(
-                sym, self._bar_freq, start=self._earliest_needed, end=self._end,
-            )
-            df = df.set_index("timestamp") if "timestamp" in df.columns else df
-            cols[sym] = df["volume"]
-
-        panel = pd.DataFrame(cols).reindex(self._full_bar_index)
-        return panel
+        price_panel = pd.DataFrame(price_cols).reindex(self._full_bar_index)
+        volume_panel = pd.DataFrame(volume_cols).reindex(self._full_bar_index)
+        return price_panel, volume_panel
 
     def _compute_vol_panel(self, price_panel: pd.DataFrame) -> pd.DataFrame:
         """
