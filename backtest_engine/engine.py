@@ -37,13 +37,22 @@ from backtest_engine import attribution
 from backtest_engine.config import (
     BacktestConfig, RunMode, ExecutionMode, CostMode,
 )
-from backtest_engine.context import MarketContextBuilder, _to_pd_freq
+from backtest_engine.config import to_pd_freq
+from backtest_engine.context import MarketContextBuilder
+from backtest_engine.pnl import PnLTracker
+from backtest_engine.rebalancer import Rebalancer
+from backtest_engine.report import BacktestReport, SCHEMA_VERSION
+from backtest_engine.weights_source import (
+    WeightsSource, PrecomputedWeights, OnlineOptimizer,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_freq(s: str | None) -> str | None:
     """归一化 pd freq 字符串：'min' / '1min' / '1T' 都 → 'min' (M3)
 
-    pandas 2.2+ 下 pd.infer_freq() 返回 'min'，但 _to_pd_freq("1m") 返回 '1min'，
+    pandas 2.2+ 下 pd.infer_freq() 返回 'min'，但 to_pd_freq("1m") 返回 '1min'，
     字面比较会误报不一致。to_offset(...).freqstr 双侧归一化解决此问题。
     """
     if s is None:
@@ -53,14 +62,6 @@ def _normalize_freq(s: str | None) -> str | None:
         return to_offset(s).freqstr
     except (ValueError, TypeError):
         return None
-from backtest_engine.pnl import PnLTracker
-from backtest_engine.rebalancer import Rebalancer
-from backtest_engine.report import BacktestReport, SCHEMA_VERSION
-from backtest_engine.weights_source import (
-    WeightsSource, PrecomputedWeights, OnlineOptimizer,
-)
-
-logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +164,7 @@ class EventDrivenBacktester:
             )
 
         # 6. 时区一致性（v3 修订）：bar_timestamps 必为 tz-aware UTC
-        pd_freq = _to_pd_freq(config.bar_freq)
+        pd_freq = to_pd_freq(config.bar_freq)
         bar_ts = pd.date_range(config.start, config.end, freq=pd_freq, tz="UTC")
         if bar_ts.tz is None:
             raise ValueError(
@@ -238,7 +239,7 @@ class EventDrivenBacktester:
         context_builder = MarketContextBuilder(reader, config)
 
         # 时段切片
-        pd_freq = _to_pd_freq(config.bar_freq)
+        pd_freq = to_pd_freq(config.bar_freq)
         bar_timestamps = pd.date_range(
             config.start, config.end, freq=pd_freq, tz="UTC",
         )

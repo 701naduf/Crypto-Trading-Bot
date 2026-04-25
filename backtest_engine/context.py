@@ -38,14 +38,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_VOL_MIN_PERIODS = 5000
 
 
-def _to_pd_freq(bar_freq: str) -> str:
-    """
-    把项目语义 bar_freq（"1m"/"5m"/"1h"）翻译为 pandas date_range freq 字符串。
-
-    pandas >= 2.2 起 "1m" 表示 month-end（不是 minute），必须用 "1min"。
-    """
-    mapping = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h"}
-    return mapping.get(bar_freq, bar_freq)
+# to_pd_freq 已移至 backtest_engine.config（B4）；保留下划线 alias 向后兼容
+from backtest_engine.config import to_pd_freq
+_to_pd_freq = to_pd_freq    # 旧名 alias，避免破坏外部测试 import
 
 
 class MarketContextBuilder:
