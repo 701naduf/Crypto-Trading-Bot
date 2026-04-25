@@ -18,6 +18,8 @@ from backtest_engine.config import (
 from backtest_engine.engine import EventDrivenBacktester
 from backtest_engine.report import BacktestReport
 
+from .conftest import FakeDataReader
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -200,6 +202,249 @@ class TestValidateEnvironment:
             EventDrivenBacktester().run(
                 cfg, reader=fake_reader, signal_store=synthetic_signal_store,
             )
+
+    # ── reviewer 第 8 轮补足：B3 / B4 / B5 三项 fail-fast 边界 ──
+
+    def test_signal_store_period_too_short_raises(
+        self, fake_reader, synthetic_signal_store, synthetic_symbols,
+    ):
+        """B3: SignalStore 时段不覆盖 config.start ~ config.end → ValueError
+
+        synthetic_signal_store 的 weights 覆盖 [synthetic_period.start, end]；
+        把 config.start 移到 SignalStore 起点之前 1 天 → 触发 #3 检查。
+        """
+        from .conftest import _make_synthetic_funding
+        # SignalStore 起点 = 2024-01-22；用 2024-01-21 作 config.start
+        cfg_start = pd.Timestamp("2024-01-21", tz="UTC")
+        cfg_end = pd.Timestamp("2024-01-23", tz="UTC")
+        # 需要 reader 至少有 21 天 lookback + 评估区间数据 → 重建一个延长版 reader
+        from .conftest import _make_synthetic_ohlcv, _make_synthetic_orderbook
+        earliest = cfg_start - pd.Timedelta(days=21)
+        reader = type(fake_reader)(
+            ohlcv_by_symbol=_make_synthetic_ohlcv(synthetic_symbols, earliest, cfg_end),
+            orderbook_by_symbol=_make_synthetic_orderbook(synthetic_symbols, earliest, cfg_end),
+            funding_by_symbol=_make_synthetic_funding(synthetic_symbols, earliest, cfg_end),
+        )
+        cfg = BacktestConfig(
+            strategy_name="synthetic_test", symbols=synthetic_symbols,
+            start=cfg_start, end=cfg_end,
+            run_mode=RunMode.VECTORIZED,
+        )
+        with pytest.raises(ValueError, match="SignalStore 时段不足"):
+            EventDrivenBacktester().run(
+                cfg, reader=reader, signal_store=synthetic_signal_store,
+            )
+
+    def test_data_reader_lookback_too_short_raises(
+        self, synthetic_signal_store, synthetic_symbols, synthetic_period,
+    ):
+        """B4: DataReader 数据起点晚于热身期所需 21 天 → ValueError
+
+        构造仅 5 天 lookback 的 reader，超过校验阈值，MarketContextBuilder 抛 ValueError。
+        """
+        from .conftest import (
+            _make_synthetic_ohlcv, _make_synthetic_orderbook, _make_synthetic_funding,
+        )
+        _earliest, start, end = synthetic_period
+        # 仅给 5 天 lookback（< 21 天 default）
+        short_earliest = start - pd.Timedelta(days=5)
+        reader_short = FakeDataReader(
+            ohlcv_by_symbol=_make_synthetic_ohlcv(synthetic_symbols, short_earliest, end),
+            orderbook_by_symbol=_make_synthetic_orderbook(synthetic_symbols, short_earliest, end),
+            funding_by_symbol=_make_synthetic_funding(synthetic_symbols, short_earliest, end),
+        )
+        cfg = BacktestConfig(
+            strategy_name="synthetic_test", symbols=synthetic_symbols,
+            start=start, end=end,
+            run_mode=RunMode.VECTORIZED,
+        )
+        with pytest.raises(ValueError, match="价格数据起点"):
+            EventDrivenBacktester().run(
+                cfg, reader=reader_short, signal_store=synthetic_signal_store,
+            )
+
+    def test_dynamic_cost_without_funding_raises(
+        self, synthetic_signal_store, synthetic_symbols, synthetic_period,
+    ):
+        """B5: DYNAMIC_COST 模式但 reader 无 funding 数据 → ValueError"""
+        from .conftest import _make_synthetic_ohlcv, _make_synthetic_orderbook
+        earliest, start, end = synthetic_period
+        reader_no_funding = FakeDataReader(
+            ohlcv_by_symbol=_make_synthetic_ohlcv(synthetic_symbols, earliest, end),
+            orderbook_by_symbol=_make_synthetic_orderbook(synthetic_symbols, earliest, end),
+            funding_by_symbol={},  # 全空
+        )
+        cfg = BacktestConfig(
+            strategy_name="synthetic_test", symbols=synthetic_symbols,
+            start=start, end=end,
+            run_mode=RunMode.EVENT_DRIVEN_DYNAMIC_COST,
+            constraints=PortfolioConstraints(
+                max_weight=0.4, leverage_cap=2.0, dollar_neutral=True,
+            ),
+        )
+        with pytest.raises(ValueError, match="DYNAMIC_COST 模式需要 funding_rate"):
+            EventDrivenBacktester().run(
+                cfg, reader=reader_no_funding, signal_store=synthetic_signal_store,
+            )
+
+
+# ---------------------------------------------------------------------------
+# reviewer 第 8 轮补足：A4/H4/G1/G4 — 完整 fail-fast 链路 + 加速逻辑
+# ---------------------------------------------------------------------------
+
+class TestRobustnessChains:
+    """
+    A4: engine 不吞 NumericalError，向上抛
+    H4: optimize_every_n_bars > 1 仅决策跳过；record 仍每 bar 调用
+    G1: funding_rates_panel.index tz != UTC（DYNAMIC_COST）→ ValueError
+    G4: context.spread = NaN → exec_report.spread_cost = NaN → V = NaN → NumericalError
+    """
+
+    def test_a4_numerical_error_propagates_through_engine(
+        self, fake_reader, synthetic_signal_store, fixed_gamma_config, monkeypatch,
+    ):
+        """A4: PnLTracker 抛 NumericalError 时 engine 不捕获，直接 propagate"""
+        from backtest_engine.pnl import NumericalError, PnLTracker
+
+        # 让 record() 第二次调用直接抛 NumericalError（模拟 V=NaN/Inf 场景）
+        original_record = PnLTracker.record
+        call_count = {"n": 0}
+
+        def raising_record(self, t, actual_w, price, exec_report):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise NumericalError("test: V=NaN injected at second record")
+            return original_record(self, t, actual_w, price, exec_report)
+
+        monkeypatch.setattr(PnLTracker, "record", raising_record)
+
+        with pytest.raises(NumericalError, match="test: V=NaN injected"):
+            EventDrivenBacktester().run(
+                fixed_gamma_config,
+                reader=fake_reader, signal_store=synthetic_signal_store,
+            )
+
+    def test_g4_spread_nan_triggers_numerical_error(
+        self, fake_reader, synthetic_signal_store, fixed_gamma_config, monkeypatch,
+    ):
+        """G4: ctx.spread NaN（FULL_COST）→ Rebalancer.spread_cost=NaN → V=NaN → NumericalError"""
+        from backtest_engine.pnl import NumericalError
+        from backtest_engine.context import MarketContextBuilder
+
+        # 让 build() 在第 2 次调用时返回 spread = NaN 的 context
+        original_build = MarketContextBuilder.build
+        call_count = {"n": 0}
+
+        def nan_spread_build(self, t, current_weights, portfolio_value):
+            ctx = original_build(self, t, current_weights, portfolio_value)
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                ctx.spread.iloc[:] = np.nan
+            return ctx
+
+        monkeypatch.setattr(MarketContextBuilder, "build", nan_spread_build)
+
+        # FULL_COST → spread_cost 实际计算 → NaN 传播到 V → NumericalError
+        with pytest.raises(NumericalError):
+            EventDrivenBacktester().run(
+                fixed_gamma_config,
+                reader=fake_reader, signal_store=synthetic_signal_store,
+            )
+
+    def test_g1_funding_panel_tz_mismatch_raises(
+        self, synthetic_signal_store, synthetic_symbols, synthetic_period,
+    ):
+        """G1: DYNAMIC_COST 下 funding 数据 tz 非 UTC → ValueError
+
+        模拟 reader.get_funding_rate 返回 tz='Asia/Shanghai' 的 timestamp
+        （上游数据未 normalize 到 UTC 的常见 bug）。
+        """
+        from .conftest import _make_synthetic_ohlcv, _make_synthetic_orderbook
+        earliest, start, end = synthetic_period
+
+        # 构造 Asia/Shanghai tz 的 funding 数据
+        settle_ts_utc = pd.date_range(
+            start.normalize(), end, freq="8h", tz="UTC",
+        )
+        settle_ts_utc = settle_ts_utc[settle_ts_utc >= start]
+        # 转 tz 为 Asia/Shanghai（保留时间 instant，但 tz 标签变）
+        settle_ts_sh = settle_ts_utc.tz_convert("Asia/Shanghai")
+        funding_dict = {}
+        for sym in synthetic_symbols:
+            funding_dict[sym] = pd.DataFrame({
+                "symbol": [sym] * len(settle_ts_sh),
+                "timestamp": settle_ts_sh,
+                "funding_rate": [0.0001] * len(settle_ts_sh),
+            })
+
+        reader_bad_tz = FakeDataReader(
+            ohlcv_by_symbol=_make_synthetic_ohlcv(synthetic_symbols, earliest, end),
+            orderbook_by_symbol=_make_synthetic_orderbook(synthetic_symbols, earliest, end),
+            funding_by_symbol=funding_dict,
+        )
+
+        cfg = BacktestConfig(
+            strategy_name="synthetic_test", symbols=synthetic_symbols,
+            start=start, end=end,
+            run_mode=RunMode.EVENT_DRIVEN_DYNAMIC_COST,
+            constraints=PortfolioConstraints(
+                max_weight=0.4, leverage_cap=2.0, dollar_neutral=True,
+            ),
+        )
+        with pytest.raises(ValueError, match="funding_rates_panel.index.tz"):
+            EventDrivenBacktester().run(
+                cfg, reader=reader_bad_tz, signal_store=synthetic_signal_store,
+            )
+
+    def test_h4_optimize_every_n_bars_decision_skipped_record_kept(
+        self, fake_reader, synthetic_signal_store, dynamic_cost_config, monkeypatch,
+    ):
+        """H4: optimize_every_n_bars=N>1 时 decision 调用 ≈ N_bars/N，但 record 调用 == N_bars
+
+        dynamic_cost_config.optimize_every_n_bars = 10
+        短时段 1 天 = 1441 bar → 期望约 145 次 decision，1441 次 record
+        """
+        from backtest_engine.weights_source import OnlineOptimizer
+        from backtest_engine.pnl import PnLTracker
+
+        decision_count = {"n": 0}
+        record_count = {"n": 0}
+
+        original_get_tw = OnlineOptimizer.get_target_weights
+
+        def counting_get_tw(self, t, cw, ctx, ph):
+            decision_count["n"] += 1
+            return original_get_tw(self, t, cw, ctx, ph)
+
+        original_record = PnLTracker.record
+
+        def counting_record(self, t, actual_w, price, exec_report):
+            record_count["n"] += 1
+            return original_record(self, t, actual_w, price, exec_report)
+
+        monkeypatch.setattr(OnlineOptimizer, "get_target_weights", counting_get_tw)
+        monkeypatch.setattr(PnLTracker, "record", counting_record)
+
+        rep = EventDrivenBacktester().run(
+            dynamic_cost_config,
+            reader=fake_reader, signal_store=synthetic_signal_store,
+        )
+
+        n_bars = rep.run_metadata["n_bars"]
+        N = dynamic_cost_config.optimize_every_n_bars  # 10
+
+        # decision: 仅 i % N == 0 调用，期望 ceil(n_bars / N) ≈ n_bars/N
+        # 容许 ±1 的边界误差（破产/早退也可能让 ratio 偏离）
+        expected_decisions = (n_bars + N - 1) // N
+        assert abs(decision_count["n"] - expected_decisions) <= 1, (
+            f"decision call count={decision_count['n']}, "
+            f"expected≈{expected_decisions} (N={N}, n_bars={n_bars})"
+        )
+        # record: 每 bar 一次
+        assert record_count["n"] == n_bars, (
+            f"record call count={record_count['n']} != n_bars={n_bars} "
+            f"（优化加速时 record 仍应每 bar 调用一次）"
+        )
 
 
 # ---------------------------------------------------------------------------
