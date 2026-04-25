@@ -231,3 +231,22 @@ class TestPlotAll:
         rep = _make_report(with_regime=False, with_deviation=False)
         fig = plot_all(rep)
         assert isinstance(fig, plt.Figure)
+
+
+class TestStep14CjkFontFallback:
+    """Step 14 / C4 / M7: rcParams 弱断言（不抓 UserWarning，对 capsys 不可靠）"""
+
+    def test_cjk_font_fallback_configured(self):
+        """plot.py import 后 matplotlib.rcParams 含 CJK 字体优先项"""
+        # plot.py import 时已调 _configure_cjk_font_fallback
+        import matplotlib
+        # 重新触发（防别的 test 改了 rcParams）
+        from backtest_engine.plot import _configure_cjk_font_fallback
+        _configure_cjk_font_fallback()
+
+        fonts = matplotlib.rcParams['font.sans-serif']
+        cjk = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'PingFang SC']
+        # 前 4 项至少有一个 CJK 字体（让 matplotlib 优先选）
+        assert any(f in fonts[:4] for f in cjk), f"前 4 项无 CJK 字体: {fonts[:4]}"
+        # axes.unicode_minus = False 防负号渲染异常
+        assert matplotlib.rcParams['axes.unicode_minus'] is False

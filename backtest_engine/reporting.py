@@ -50,6 +50,12 @@ def to_markdown(
     import matplotlib
     matplotlib.use("Agg", force=False)
 
+    # Step 14 / C4: 配置 CJK 字体 fallback（防中文 glyph missing 渲染成方框）
+    matplotlib.rcParams['font.sans-serif'] = [
+        'Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'PingFang SC', 'DejaVu Sans',
+    ]
+    matplotlib.rcParams['axes.unicode_minus'] = False
+
     output_dir = Path(output_dir)
     figures_dir = output_dir / "figures"
 

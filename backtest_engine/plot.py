@@ -27,6 +27,23 @@ if TYPE_CHECKING:
     import matplotlib.figure
     from backtest_engine.report import BacktestReport
 
+
+# Step 14 / C4: 配置 matplotlib CJK 字体 fallback，避免 deviation_attribution 等
+# 含中文标签的图渲染成方框（DejaVu Sans 缺 CJK glyph 时 matplotlib 默认 missing → 方框 + warning）
+def _configure_cjk_font_fallback() -> None:
+    try:
+        import matplotlib
+        # 用首选 CJK 字体覆盖默认；Windows / macOS / Linux 常见安装字体均覆盖
+        matplotlib.rcParams['font.sans-serif'] = [
+            'Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'PingFang SC', 'DejaVu Sans',
+        ]
+        matplotlib.rcParams['axes.unicode_minus'] = False
+    except ImportError:
+        pass
+
+
+_configure_cjk_font_fallback()
+
 logger = logging.getLogger(__name__)
 
 
