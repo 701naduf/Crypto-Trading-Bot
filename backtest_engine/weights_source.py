@@ -156,6 +156,10 @@ class OnlineOptimizer:
         self._signals = signals_panel
         self._cost_mode = cost_mode
 
+        # Z16 dedup 集合：事件循环每 bar 调 optimize_step → cost.py，若 ADV 持续 NaN
+        # 会 log spam；此 set 让"首次出现"的 NaN symbol 才 warning。
+        self._adv_nan_warned: set[str] = set()
+
     def get_target_weights(
         self,
         t: pd.Timestamp,
@@ -185,4 +189,5 @@ class OnlineOptimizer:
             current_weights=current_weights,
             market_context=ctx_for_opt,
             price_history=price_history,
+            adv_nan_warned=self._adv_nan_warned,
         )

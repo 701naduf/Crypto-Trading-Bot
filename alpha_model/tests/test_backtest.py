@@ -6,6 +6,8 @@ backtest/ 模块的单元测试
     - vectorized.py: 向量化回测
 """
 
+import logging
+
 import pytest
 import numpy as np
 import pandas as pd
@@ -654,3 +656,277 @@ class TestVectorizedVolPanelKwarg:
         # 两 result 对应的 impact = total_cost (fee=0 隔离)
         ratio = r_scaled.total_cost / r_default.total_cost
         np.testing.assert_allclose(ratio, 4.0, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Step 0b (Z4/Z6/Z11/Z12/Z13): 跨模块 ADV 兜底一致性 + warmup NaN 处理
+# ---------------------------------------------------------------------------
+
+class TestImpactAdvFloorConsistency:
+    """Z4/Z11/Z13: 四处 impact 实现在 ADV 边界上一致"""
+
+    def _setup(self, adv_value):
+        """构造 ADV=adv_value 的固定场景，跨四处比较 impact 数值"""
+        n_symbols = 2
+        symbols = ["BTC/USDT", "ETH/USDT"]
+        sigma = 0.03
+        V = 10000.0
+        coeff = 0.1
+        delta_w = np.array([0.3, -0.2])
+        return symbols, sigma, V, coeff, delta_w, adv_value
+
+    def _expected_impact(self, sigma, V, coeff, delta_w, adv_floor=1.0):
+        """使用 ADV=floor 的预期 impact 值"""
+        return float(np.sum(
+            (2.0 / 3.0) * coeff * sigma * np.sqrt(V / adv_floor)
+            * np.power(np.abs(delta_w), 1.5)
+        ))
+
+    def _impact_vectorized(self, symbols, sigma, V, coeff, delta_w, adv_value):
+        """通过 estimate_market_impact (DataFrame 路径)"""
+        idx = pd.date_range("2024-01-01", periods=2, freq="1min", tz="UTC")
+        delta_df = pd.DataFrame([np.zeros_like(delta_w), delta_w],
+                                 index=idx, columns=symbols)
+        adv_df = pd.DataFrame([[adv_value, adv_value]] * 2, index=idx, columns=symbols)
+        vol_df = pd.DataFrame([[sigma, sigma]] * 2, index=idx, columns=symbols)
+        impact = estimate_market_impact(delta_df, adv_df, vol_df, V, coeff)
+        return float(impact.iloc[1].sum())   # 第二行 delta 非零
+
+    def _impact_cost_py(self, symbols, sigma, V, coeff, delta_w, adv_value):
+        """通过 cost.py build_cost_expression (cvxpy 路径)；fee=0+spread=0 隔离 impact"""
+        import cvxpy as cp
+        from execution_optimizer import MarketContext
+        from execution_optimizer.cost import build_cost_expression
+
+        ctx = MarketContext(
+            timestamp=pd.Timestamp("2024-01-01", tz="UTC"),
+            symbols=symbols,
+            spread=pd.Series([0.0] * len(symbols), index=symbols),
+            volatility=pd.Series([sigma] * len(symbols), index=symbols),
+            adv=pd.Series([adv_value] * len(symbols), index=symbols),
+            portfolio_value=V,
+            funding_rate=None,
+        )
+        delta_var = cp.Variable(len(symbols))
+        delta_var.value = delta_w
+        cost_expr = build_cost_expression(
+            delta_var, ctx, impact_coeff=coeff, fee_rate=0.0,
+        )
+        return float(cost_expr.value)   # = impact only（fee=spread=0）
+
+    def _impact_rebalancer(self, symbols, sigma, V, coeff, delta_w, adv_value):
+        """通过 Rebalancer._execute_market 标量路径"""
+        from backtest_engine.rebalancer import Rebalancer
+        from backtest_engine.config import ExecutionMode, CostMode
+        from execution_optimizer import MarketContext
+
+        r = Rebalancer(
+            execution_mode=ExecutionMode.MARKET,
+            cost_mode=CostMode.MATCH_VECTORIZED,   # 隔离 spread
+            min_trade_value=0.0001,
+            fee_rate=0.0,
+            impact_coeff=coeff,
+        )
+        ctx = MarketContext(
+            timestamp=pd.Timestamp("2024-01-01", tz="UTC"),
+            symbols=symbols,
+            spread=pd.Series([0.0] * len(symbols), index=symbols),
+            volatility=pd.Series([sigma] * len(symbols), index=symbols),
+            adv=pd.Series([adv_value] * len(symbols), index=symbols),
+            portfolio_value=V,
+            funding_rate=None,
+        )
+        cw = pd.Series(np.zeros_like(delta_w), index=symbols)
+        tw = pd.Series(delta_w, index=symbols)
+        _, report = r.execute(cw, tw, ctx, pd.Series())
+        return float(report.impact_cost)
+
+    def _impact_per_symbol(self, symbols, sigma, V, coeff, delta_w, adv_value):
+        """通过 compute_per_symbol_cost (DataFrame 路径)"""
+        from backtest_engine.attribution import compute_per_symbol_cost
+
+        idx = pd.date_range("2024-01-01", periods=2, freq="1min", tz="UTC")
+        # bar 0: w=0；bar 1: w=delta_w（diff 后 bar 1 = delta_w）
+        weights = pd.DataFrame(
+            [np.zeros_like(delta_w), delta_w],
+            index=idx, columns=symbols,
+        )
+        spread_df = pd.DataFrame([[0.0, 0.0]] * 2, index=idx, columns=symbols)
+        adv_df = pd.DataFrame([[adv_value, adv_value]] * 2, index=idx, columns=symbols)
+        vol_df = pd.DataFrame([[sigma, sigma]] * 2, index=idx, columns=symbols)
+        V_history = pd.Series([V, V], index=idx)
+
+        out = compute_per_symbol_cost(
+            weights_history=weights,
+            spread_panel=spread_df, adv_panel=adv_df, vol_panel=vol_df,
+            fee_rate=0.0, impact_coeff=coeff,
+            portfolio_value_history=V_history,
+        )
+        return float(out["impact"].iloc[1].sum())   # bar 1 是非零调仓
+
+    def test_impact_adv_floor_consistency(self):
+        """Z4: ADV=0.5 边界四处 impact 精确一致 (rtol=1e-12)"""
+        symbols, sigma, V, coeff, delta_w, adv_value = self._setup(adv_value=0.5)
+        expected = self._expected_impact(sigma, V, coeff, delta_w, adv_floor=1.0)
+
+        impact_vec = self._impact_vectorized(symbols, sigma, V, coeff, delta_w, adv_value)
+        impact_cp = self._impact_cost_py(symbols, sigma, V, coeff, delta_w, adv_value)
+        impact_reb = self._impact_rebalancer(symbols, sigma, V, coeff, delta_w, adv_value)
+        impact_per = self._impact_per_symbol(symbols, sigma, V, coeff, delta_w, adv_value)
+
+        np.testing.assert_allclose(impact_vec, expected, rtol=1e-12)
+        np.testing.assert_allclose(impact_cp, expected, rtol=1e-12)
+        np.testing.assert_allclose(impact_reb, expected, rtol=1e-12)
+        np.testing.assert_allclose(impact_per, expected, rtol=1e-12)
+
+    def test_impact_adv_zero_uses_floor(self):
+        """Z11/Z13: ADV=0 关键边界，**四处一致性**断言（旧 vectorized 给 0；新四处用 ADV=1）"""
+        symbols, sigma, V, coeff, delta_w, adv_value = self._setup(adv_value=0.0)
+        expected = self._expected_impact(sigma, V, coeff, delta_w, adv_floor=1.0)
+
+        impact_vec = self._impact_vectorized(symbols, sigma, V, coeff, delta_w, adv_value)
+        impact_cp = self._impact_cost_py(symbols, sigma, V, coeff, delta_w, adv_value)
+        impact_reb = self._impact_rebalancer(symbols, sigma, V, coeff, delta_w, adv_value)
+        impact_per = self._impact_per_symbol(symbols, sigma, V, coeff, delta_w, adv_value)
+
+        np.testing.assert_allclose(impact_vec, expected, rtol=1e-12)
+        np.testing.assert_allclose(impact_cp, expected, rtol=1e-12)
+        np.testing.assert_allclose(impact_reb, expected, rtol=1e-12)
+        np.testing.assert_allclose(impact_per, expected, rtol=1e-12)
+        # 新行为：impact 非零（旧 vectorized 给 0）
+        assert impact_vec > 0
+
+
+class TestImpactWarmupHandling:
+    """Z6: vol_panel warmup 期 NaN 应归 0，不传播"""
+
+    def test_warmup_nan_filled_to_zero(self):
+        """vol_panel.iloc[:30] = NaN + ADV/Δw 全 finite → impact 全 finite，warmup 期 = 0"""
+        n = 100
+        symbols = ["BTC/USDT", "ETH/USDT"]
+        idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+        rng = np.random.RandomState(0)
+
+        delta_df = pd.DataFrame(
+            rng.uniform(-0.1, 0.1, (n, 2)), index=idx, columns=symbols,
+        )
+        adv_df = pd.DataFrame(np.full((n, 2), 1e9), index=idx, columns=symbols)
+
+        # 前 30 bar vol = NaN（warmup）
+        vol_df = pd.DataFrame(np.full((n, 2), 0.03), index=idx, columns=symbols)
+        vol_df.iloc[:30] = np.nan
+
+        impact = estimate_market_impact(delta_df, adv_df, vol_df, 10000.0, 0.1)
+        # warmup 期 impact 应全为 0（NaN 经 fillna(0) 归零）
+        assert (impact.iloc[:30] == 0.0).all().all()
+        # warmup 后正常 finite 非零
+        assert np.isfinite(impact.iloc[30:].values).all()
+        assert (impact.iloc[30:].values > 0).all()
+
+
+class TestAdvNanConsistencyAcrossModes:
+    """Z12: 四处 ADV NaN 处理行为完全一致（silent 替换 + logger.warning）"""
+
+    def test_four_modules_handle_adv_nan_identically(self, caplog):
+        """构造 ADV[BTC] = NaN，验证四处 impact 都用 ADV=1 算（rtol=1e-12 一致）+ 都触发 warning"""
+        symbols = ["BTC/USDT", "ETH/USDT"]
+        sigma = 0.03
+        V = 10000.0
+        coeff = 0.1
+        delta_w = np.array([0.3, -0.2])
+        # ADV[BTC] = NaN, ADV[ETH] = 1e9
+        adv = np.array([np.nan, 1e9])
+
+        # 预期：BTC 用 ADV=1.0，ETH 用 ADV=1e9
+        expected_impact = float(
+            (2.0/3.0) * coeff * sigma * np.sqrt(V / 1.0) * abs(delta_w[0])**1.5
+            + (2.0/3.0) * coeff * sigma * np.sqrt(V / 1e9) * abs(delta_w[1])**1.5
+        )
+
+        with caplog.at_level(logging.WARNING):
+            # (1) vectorized
+            idx = pd.date_range("2024-01-01", periods=2, freq="1min", tz="UTC")
+            delta_df = pd.DataFrame([np.zeros_like(delta_w), delta_w],
+                                    index=idx, columns=symbols)
+            adv_df = pd.DataFrame([adv, adv], index=idx, columns=symbols)
+            vol_df = pd.DataFrame([[sigma, sigma]] * 2, index=idx, columns=symbols)
+            impact_vec = float(estimate_market_impact(delta_df, adv_df, vol_df, V, coeff).iloc[1].sum())
+
+            # (2) cost.py
+            import cvxpy as cp
+            from execution_optimizer import MarketContext
+            from execution_optimizer.cost import build_cost_expression
+            ctx = MarketContext(
+                timestamp=idx[0], symbols=symbols,
+                spread=pd.Series([0.0, 0.0], index=symbols),
+                volatility=pd.Series([sigma, sigma], index=symbols),
+                adv=pd.Series(adv, index=symbols),
+                portfolio_value=V, funding_rate=None,
+            )
+            delta_var = cp.Variable(2)
+            delta_var.value = delta_w
+            impact_cp = float(build_cost_expression(
+                delta_var, ctx, impact_coeff=coeff, fee_rate=0.0,
+            ).value)
+
+            # (3) Rebalancer
+            from backtest_engine.rebalancer import Rebalancer
+            from backtest_engine.config import ExecutionMode, CostMode
+            r = Rebalancer(
+                execution_mode=ExecutionMode.MARKET, cost_mode=CostMode.MATCH_VECTORIZED,
+                min_trade_value=0.0001, fee_rate=0.0, impact_coeff=coeff,
+            )
+            cw = pd.Series([0.0, 0.0], index=symbols)
+            tw = pd.Series(delta_w, index=symbols)
+            _, report = r.execute(cw, tw, ctx, pd.Series())
+            impact_reb = float(report.impact_cost)
+
+            # (4) compute_per_symbol_cost
+            from backtest_engine.attribution import compute_per_symbol_cost
+            weights = pd.DataFrame([np.zeros_like(delta_w), delta_w],
+                                    index=idx, columns=symbols)
+            out = compute_per_symbol_cost(
+                weights_history=weights,
+                spread_panel=pd.DataFrame([[0, 0]] * 2, index=idx, columns=symbols),
+                adv_panel=adv_df,
+                vol_panel=vol_df,
+                fee_rate=0.0, impact_coeff=coeff,
+                portfolio_value_history=pd.Series([V, V], index=idx),
+            )
+            impact_per = float(out["impact"].iloc[1].sum())
+
+        # 四处 impact 数值一致
+        np.testing.assert_allclose(impact_vec, expected_impact, rtol=1e-12)
+        np.testing.assert_allclose(impact_cp, expected_impact, rtol=1e-12)
+        np.testing.assert_allclose(impact_reb, expected_impact, rtol=1e-12)
+        np.testing.assert_allclose(impact_per, expected_impact, rtol=1e-12)
+
+        # 四处都触发 warning（消息含 "含 NaN" + "BTC/USDT"）
+        warning_msgs = [r.message for r in caplog.records if "含 NaN" in r.message]
+        # 至少 4 处都触发（vectorized + cost.py + Rebalancer + per_symbol）
+        assert len(warning_msgs) >= 4, f"未在四处都触发 warning: {warning_msgs}"
+
+
+class TestImpactNoSilentNanAfterFillna:
+    """O5: fillna(0) 后下游 sum(skipna=False) 不会因任何 NaN 漏过而崩"""
+
+    def test_finite_inputs_no_nan_in_sum(self):
+        """完整 finite 输入 → impact 全 finite → sum 无异常"""
+        n = 100
+        symbols = ["BTC/USDT"]
+        idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+        rng = np.random.RandomState(0)
+        prices = pd.DataFrame(
+            100 * np.exp(np.cumsum(rng.randn(n) * 0.001)),
+            index=idx, columns=symbols,
+        )
+        weights = pd.DataFrame(
+            rng.uniform(-0.3, 0.3, (n, 1)), index=idx, columns=symbols,
+        )
+        adv = pd.DataFrame(np.full((n, 1), 1e9), index=idx, columns=symbols)
+        # 跑通即说明 sum(skipna=False) 不抛
+        result = vectorized_backtest(
+            weights, prices, fee_rate=0.0, impact_coeff=0.1,
+            adv_panel=adv, portfolio_value=10000.0,
+        )
+        assert np.isfinite(result.total_cost)

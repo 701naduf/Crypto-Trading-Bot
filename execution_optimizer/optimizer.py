@@ -89,6 +89,7 @@ class ExecutionOptimizer:
         current_weights: pd.Series,
         market_context: MarketContext,
         price_history: pd.DataFrame,
+        adv_nan_warned: set[str] | None = None,
     ) -> pd.Series:
         """
         单步优化：给定当前信号和市场状态，返回最优目标权重
@@ -103,6 +104,10 @@ class ExecutionOptimizer:
                              index=DatetimeIndex, columns ⊇ symbols。
                              用于协方差估计和 beta 估计。
                              调用方须保证无未来信息（严格 ≤ t）
+            adv_nan_warned:  Z16 dedup 集合（OnlineOptimizer 持有）。
+                             事件循环每 bar 调用 optimize_step，若 ADV 持续 NaN
+                             会 log spam；此 set 让"首次出现"的 NaN symbol 才 warning。
+                             None 表示无 dedup（每次都 warning，适用于一次性调用）。
 
         Returns:
             目标权重 pd.Series, index=symbols。
@@ -138,6 +143,7 @@ class ExecutionOptimizer:
         cost_expr = build_cost_expression(
             delta_w, market_context,
             impact_coeff=self.impact_coeff, fee_rate=self.fee_rate,
+            adv_nan_warned=adv_nan_warned,
         )
 
         # 目标函数

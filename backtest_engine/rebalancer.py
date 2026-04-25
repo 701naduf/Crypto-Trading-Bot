@@ -114,6 +114,10 @@ class Rebalancer:
         self._fee_rate = fee_rate
         self._impact_coeff = impact_coeff
 
+        # Z16 dedup 集合：事件循环每 bar 调用 _execute_market，若 ADV 持续 NaN 会 log spam；
+        # 此 set 让"首次出现"的 NaN symbol 才 warning。
+        self._adv_nan_warned: set[str] = set()
+
     def execute(
         self,
         current_weights: pd.Series,
@@ -186,8 +190,13 @@ class Rebalancer:
             spread_cost = float(np.sum(spread_arr / 2.0 * abs_delta_arr))
 
         # ③ impact: (2/3) × Σ(coeff × σ × √(V/ADV) × |Δw|^1.5)
-        # ADV 兜底（与 cost.py / compute_per_symbol_cost 一致）
-        adv_safe = np.maximum(adv_arr, 1.0)
+        # ADV 兜底（Z4/Z12 跨四处统一 + Z16 dedup；修 pre-existing np.maximum(NaN,1)=NaN bug）
+        from alpha_model.backtest.adv_helpers import safe_adv_array
+        adv_safe = safe_adv_array(
+            adv_arr, symbols,
+            context="Rebalancer._execute_market",
+            warned_set=self._adv_nan_warned,
+        )
         sqrt_ratio = np.sqrt(V / adv_safe)
         impact_per_sym = (
             (2.0 / 3.0) * coeff_arr * sigma_arr * sqrt_ratio * np.power(abs_delta_arr, 1.5)

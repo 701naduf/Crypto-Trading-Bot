@@ -45,26 +45,39 @@ def build_cost_expression(
     context: MarketContext,
     impact_coeff: float | pd.Series = DEFAULT_IMPACT_COEFF,
     fee_rate: float = DEFAULT_FEE_RATE,
+    adv_nan_warned: set[str] | None = None,
 ) -> cp.Expression:
     """
     构建无量纲的总执行成本表达式
 
     Args:
-        delta_w:      权重变化向量 cp.Variable, shape=(N,)
-        context:      当前时刻的市场状态
-        impact_coeff: sqrt-model 校准系数。
-                      float → 全标的共享；
-                      pd.Series(index=symbols) → 逐标的独立校准
-        fee_rate:     taker 手续费率
+        delta_w:        权重变化向量 cp.Variable, shape=(N,)
+        context:        当前时刻的市场状态
+        impact_coeff:   sqrt-model 校准系数。
+                        float → 全标的共享；
+                        pd.Series(index=symbols) → 逐标的独立校准
+        fee_rate:       taker 手续费率
+        adv_nan_warned: Z16 dedup 集合（OnlineOptimizer / 调用方持有）。
+                        cost.py 在事件循环每 bar 调用，若 ADV 持续 NaN 会 log spam；
+                        通过此 set 让"首次出现的 NaN symbol"才触发 warning。
 
     Returns:
         cvxpy scalar Expression（凸），无量纲
     """
+    from alpha_model.backtest.adv_helpers import safe_adv_array
+
     V = context.portfolio_value
     symbols = context.symbols
     spread_arr = context.spread.reindex(symbols).values.astype(float)
     sigma_arr  = context.volatility.reindex(symbols).values.astype(float)
     adv_arr    = context.adv.reindex(symbols).values.astype(float)
+
+    # ADV 兜底（Z4/Z12 跨四处统一 + Z16 dedup）
+    adv_safe = safe_adv_array(
+        adv_arr, list(symbols),
+        context="build_cost_expression",
+        warned_set=adv_nan_warned,
+    )
 
     # 逐标的冲击系数
     if isinstance(impact_coeff, pd.Series):
@@ -84,9 +97,7 @@ def build_cost_expression(
     # ③ 市场冲击: (2/3) × Σ(eff_coeff_i × |Δw_i|^1.5)
     #    eff_coeff_i = coeff_i × σ_i × √(V / ADV_i)
     #    2/3 来自 Almgren-Chriss 边际冲击率对 q 的积分，显式保留
-    eff_coeff = (2.0 / 3.0) * coeff_arr * sigma_arr * np.sqrt(
-        V / np.maximum(adv_arr, 1.0)
-    )
+    eff_coeff = (2.0 / 3.0) * coeff_arr * sigma_arr * np.sqrt(V / adv_safe)
     impact_cost = eff_coeff @ cp.power(delta_abs, 1.5)
 
     return commission + spread_cost + impact_cost

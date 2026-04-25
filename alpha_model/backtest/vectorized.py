@@ -66,11 +66,21 @@ def estimate_market_impact(
 
     公式: impact_i = (2/3) × impact_coeff × σ_i × √(V / ADV_i) × |Δw_i|^1.5
 
-    推导: 边际冲击率 σ√(q/ADV) 对 q 从 0 到 Q 积分得 (2/3)σQ^1.5/√ADV，
-    代入 Q = |Δw|×V 并 ÷ V 归一化到收益率空间。
+    ADV 兜底（Z4 + Z12，跨四处统一）:
+      ADV < 1.0 USD 或 NaN 时强制按 ADV=1.0 计算，与 execution_optimizer.cost /
+      backtest_engine.Rebalancer / backtest_engine.attribution.compute_per_symbol_cost
+      四处兜底策略**完全一致**。NaN 触发 logger.warning（Option B：silent + warning，
+      与 N1 funding NaN 风格一致）。
 
-    与 execution_optimizer.cost.build_cost_expression 中的 impact 分量公式一致，
-    以支持"完美执行下事件驱动 ≈ 向量化"的可比性校验。
+    NaN 处理（Z6 + Z8）:
+      vol_panel warmup 期 NaN（rolling std min_periods 不足）和 delta_weights 首行
+      NaN（pandas diff 首行恒 NaN）经 fillna(0) 显式归零。这是合法 NaN，但 fillna(0)
+      会**低估成本**（impact=0 → ed gain 更高 → 乐观偏差，**非保守**）；warmup 占比
+      ~0.07%（10 bar / 30240 bar），影响微小。用户应在 21 天热身期外评估 P&L 主体。
+
+      与 PnLTracker.record 的 sum(skipna=False) 防御**不同源**：
+        - 此处 NaN：合法的"未启动状态"
+        - PnLTracker NaN：运行时数据/公式 bug → fail-fast
 
     Args:
         delta_weights:    权重变化面板 (timestamp × symbol)
@@ -84,21 +94,17 @@ def estimate_market_impact(
     Returns:
         市场冲击成本面板 (timestamp × symbol)，单位为收益率
     """
-    # 诊断: ADV=0 意味着该标的无流动性，冲击无法估计
-    zero_adv_ratio = (adv_panel == 0).sum() / max(len(adv_panel), 1)
-    for sym in zero_adv_ratio.index:
-        if zero_adv_ratio[sym] > 0.1:
-            logger.warning(
-                "标的 '%s' ADV=0 占比 %.1f%%，流动性不足，市场冲击估计不可靠",
-                sym, zero_adv_ratio[sym] * 100,
-            )
+    from alpha_model.backtest.adv_helpers import safe_adv_panel
+
+    # ADV 兜底（Z4/Z12 跨四处统一）
+    adv_safe = safe_adv_panel(adv_panel, context="estimate_market_impact")
 
     # Almgren-Chriss 总冲击成本: (2/3) × coeff × σ × √(V/ADV) × |Δw|^1.5
-    adv_safe = adv_panel.replace(0, np.nan)
     impact = (2.0 / 3.0) * impact_coeff * volatility_panel \
              * np.sqrt(portfolio_value / adv_safe) \
              * delta_weights.abs().pow(1.5)
 
+    # vol_panel warmup 期 NaN + delta_weights 首行 NaN 经 fillna(0) 显式归零（Z6/Z8）
     return impact.fillna(0)
 
 
@@ -200,7 +206,9 @@ def vectorized_backtest(
             delta_w, adv_aligned, vol,
             portfolio_value, impact_coeff,
         )
-        impact_cost = impact.sum(axis=1)
+        # skipna=False 防御：estimate_market_impact 已 fillna(0)，下游 sum 应无 NaN；
+        # skipna=False 让任何意外 NaN 暴露而非静默吞掉
+        impact_cost = impact.sum(axis=1, skipna=False)
 
     total_cost_series = fee_cost + spread_cost + impact_cost
     total_cost_scalar = total_cost_series.sum()

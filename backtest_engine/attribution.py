@@ -489,8 +489,9 @@ def compute_per_symbol_cost(
 
     # 3. impact per symbol = (2/3) × coeff × σ × √(V_prev/ADV) × |Δw|^1.5
     V_prev = portfolio_value_history.shift(1).reindex(idx)
-    # ADV 兜底（§11.7.6 与 cost.py / Rebalancer 一致）
-    adv_safe = adv_aligned.where(adv_aligned >= 1.0, 1.0)
+    # ADV 兜底（Z4/Z12 跨四处统一 + NaN warning）
+    from alpha_model.backtest.adv_helpers import safe_adv_panel
+    adv_safe = safe_adv_panel(adv_aligned, context="compute_per_symbol_cost")
     sqrt_ratio = np.sqrt(V_prev.values[:, None] / adv_safe.values)
 
     if isinstance(impact_coeff, pd.Series):
