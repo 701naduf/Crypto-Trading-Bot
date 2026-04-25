@@ -29,6 +29,7 @@ import pandas as pd
 
 from data_infra.data.reader import DataReader
 from alpha_model.store.signal_store import SignalStore
+from alpha_model.backtest.performance import BacktestResult
 from alpha_model.backtest.vectorized import vectorized_backtest
 from execution_optimizer import ExecutionOptimizer
 
@@ -456,11 +457,10 @@ class EventDrivenBacktester:
         else:
             iter_obj = deps.bar_timestamps
 
-        i = -1  # 应对 bar_timestamps 为空（边界）
-        last_t: pd.Timestamp | None = None
+        # Step 5 / A4: 独立 n_recorded 计数器（替代 i+1）；记录 record() 实际调用次数。
+        # (a') 早退路径上 record() 未调用，n_recorded 不递增 → 与 weights_history 行数一致。
+        n_recorded = 0
         for i, t in enumerate(iter_obj):
-            last_t = t
-
             # (a) Funding 事件检测与扣款
             if t in deps.funding_rates_panel.index:
                 row = deps.funding_rates_panel.loc[t]
@@ -470,6 +470,7 @@ class EventDrivenBacktester:
                 deps.pnl_tracker.apply_funding_settlement(t, current_w, row)
 
             # (a') funding 触发真实破产（V≤0 finite）→ 显式 break
+            # 注：v1 自然路径下 current_w=0 → funding_total=0 → 不会触发；仅 v2 启用
             if deps.pnl_tracker.is_bankrupt:
                 logger.warning(
                     "funding 触发破产：t=%s, V=%s，本 bar 不再决策/执行",
@@ -502,6 +503,7 @@ class EventDrivenBacktester:
             deps.pnl_tracker.record(
                 t, actual_w, deps.price_panel.loc[t], exec_report,
             )
+            n_recorded += 1
             current_w = actual_w
 
             # (f) 破产终止
@@ -520,10 +522,19 @@ class EventDrivenBacktester:
                     i + 1, len(deps.bar_timestamps), deps.pnl_tracker.portfolio_value,
                 )
 
-        # 循环后产出
-        # 如果一个 bar 都没跑：构造空 BacktestResult 不现实；直接抛
-        if len(deps.pnl_tracker._weights_history) == 0:
-            raise RuntimeError("事件循环未执行任何 bar；可能是 bar_timestamps 为空")
+        # Step 5 / M5: n_recorded == 0 时的两种场景：
+        #   - bar_timestamps 为空（config.start/end 在数据范围外）→ 抛 RuntimeError
+        #   - 第 1 bar funding 即破产（v1 不可达，仅防御性兜底）→ 返回 sentinel report
+        if n_recorded == 0:
+            if len(deps.bar_timestamps) == 0:
+                raise RuntimeError(
+                    "bar_timestamps 为空；config.start/end 可能在数据范围外"
+                )
+            logger.warning(
+                "首 bar t=%s 无任何 record（funding 即破产 (a') 早退）；返回 sentinel BacktestReport",
+                deps.bar_timestamps[0],
+            )
+            return self._build_sentinel_report(config, deps, t0)
 
         base_result = deps.pnl_tracker.compute_backtest_result(
             deps.price_panel, config.periods_per_year,
@@ -561,7 +572,8 @@ class EventDrivenBacktester:
             "cost_mode": config.cost_mode.value,
             "execution_mode": config.execution_mode.value,
             "start": config.start, "end": config.end,
-            "n_bars": i + 1,
+            "n_bars": n_recorded,                  # Step 5 / A4: 用 n_recorded 替代 i+1，
+                                                     # (a') 早退时不计入未 record 的 bar
             "n_bars_planned": int(len(deps.bar_timestamps)),
             "walltime_seconds": time.monotonic() - t0,
             "schema_version": SCHEMA_VERSION,
@@ -576,5 +588,85 @@ class EventDrivenBacktester:
             funding_settlements=funding_settlements,
             bankruptcy_timestamp=deps.pnl_tracker.bankruptcy_timestamp,
             run_metadata=run_metadata,
+            context_panels=None,
+        )
+
+    def _build_sentinel_report(
+        self, config: BacktestConfig, deps: _BacktestDependencies, t0: float,
+    ) -> BacktestReport:
+        """
+        首 bar funding 即破产时返回的退化 report (Step 5 / M5 / Z2 / Z3)。
+
+        Z2 docstring: 在 v1 当前实现下，事件循环 current_w 初始化为 pd.Series(0.0, index=symbols)。
+        第 1 bar (a) 时 funding_rate_total = (0_vec × rates).sum() = 0，V 不变，is_bankrupt
+        不会触发。所以 v1 路径下此 sentinel 实际不可达，仅作防御性兜底；v2 引入"非零初始
+        权重"或"持仓快照恢复"时启用。
+
+        O3 docstring: cost_breakdown.annualized_bp 全 0 是"年化无意义"占位（n_bars=0 时
+        mean 数学上无定义）。用户应看 cost_breakdown.absolute['funding'] 字段获取真实
+        funding 总扣款；annualized_bp 不应作为投资分析依据。
+        """
+        t0_bar = deps.bar_timestamps[0]
+        V = deps.pnl_tracker.portfolio_value
+        sentinel_idx = pd.DatetimeIndex([t0_bar])
+
+        base = BacktestResult(
+            equity_curve=pd.Series([V], index=sentinel_idx),
+            returns=pd.Series([0.0], index=sentinel_idx),
+            turnover=pd.Series([0.0], index=sentinel_idx),
+            weights_history=pd.DataFrame(0.0, index=sentinel_idx, columns=config.symbols),
+            gross_returns=pd.Series([0.0], index=sentinel_idx),
+            total_cost=0.0,
+        )
+
+        funding_evt = deps.pnl_tracker.funding_events
+        funding_total_rate = float(funding_evt.sum()) if len(funding_evt) > 0 else 0.0
+        funding_settlements = (
+            {"n_events": int(len(funding_evt)),
+             "total_rate": funding_total_rate,
+             "mean_rate_per_event": float(funding_evt.mean()),
+             "first_event": funding_evt.index[0], "last_event": funding_evt.index[-1]}
+            if len(funding_evt) > 0 else None
+        )
+
+        # Z3: 显式定义 cost_breakdown 各字段（不再用 ...）
+        absolute = {
+            "fee": 0.0, "spread": 0.0, "impact": 0.0,
+            "funding": funding_total_rate,
+            "total": funding_total_rate,
+        }
+        # n_recorded=0 时 mean 数学无定义；约定置 0（O3 docstring 说明）
+        annualized_bp = dict.fromkeys(["fee", "spread", "impact", "funding", "total"], 0.0)
+        # share: total 非零时 funding 占 ±100%；total=0 时全 NaN（与 cost_decomposition 一致）
+        denom = abs(funding_total_rate)
+        if denom == 0.0:
+            share = {k: float("nan") for k in ("fee", "spread", "impact", "funding")}
+        else:
+            share = {
+                "fee": 0.0, "spread": 0.0, "impact": 0.0,
+                "funding": funding_total_rate / denom,    # ±1.0
+            }
+        cost_breakdown = {
+            "absolute": absolute,
+            "annualized_bp": annualized_bp,
+            "share": share,
+        }
+
+        return BacktestReport(
+            base=base, config=config,
+            cost_breakdown=cost_breakdown,
+            deviation=None, regime_stats=None,
+            funding_settlements=funding_settlements,
+            bankruptcy_timestamp=t0_bar,
+            run_metadata={
+                "run_mode": config.run_mode.value,
+                "cost_mode": config.cost_mode.value,
+                "execution_mode": config.execution_mode.value,
+                "start": config.start, "end": config.end,
+                "n_bars": 0,
+                "n_bars_planned": int(len(deps.bar_timestamps)),
+                "walltime_seconds": time.monotonic() - t0,
+                "schema_version": SCHEMA_VERSION,
+            },
             context_panels=None,
         )

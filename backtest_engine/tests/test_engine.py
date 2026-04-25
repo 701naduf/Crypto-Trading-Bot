@@ -274,3 +274,172 @@ class TestVolConsistencyAcrossModes:
         # rtol=1e-10 严格断言两路径同源
         import numpy as np
         np.testing.assert_allclose(base_total, cb_total, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Step 5 (A4/M5/Z3/Z10): n_bars 计数 + sentinel report
+# ---------------------------------------------------------------------------
+
+class TestStep5SentinelAndNBars:
+    """
+    A4: n_bars 用 n_recorded 替代 i+1（防 (a') 早退 off-by-one）
+    M5: 首 bar funding 即破产返回 sentinel BacktestReport
+    Z3: sentinel cost_breakdown 三视图字段完整 + 数值正确
+    Z10: 用 fake_apply_funding 精细 fixture 模拟"funding 触发破产"
+    """
+
+    def test_n_bars_equals_weights_history_length(
+        self, fake_reader, synthetic_signal_store, fixed_gamma_config,
+    ):
+        """A4: n_bars == n_recorded == weights_history 行数（无破产场景下都等于 n_bars_planned）"""
+        rep = EventDrivenBacktester().run(
+            fixed_gamma_config,
+            reader=fake_reader, signal_store=synthetic_signal_store,
+        )
+        meta = rep.run_metadata
+        wh_rows = len(rep.base.weights_history)
+        assert meta["n_bars"] == wh_rows, (
+            f"n_bars={meta['n_bars']} != weights_history rows={wh_rows}（v3 off-by-one bug 回归）"
+        )
+
+    def test_first_bar_funding_bankruptcy_returns_sentinel(
+        self, fake_reader, synthetic_signal_store, fixed_gamma_config, monkeypatch,
+    ):
+        """M5/Z10: fake_apply_funding 让首 funding event 即破产 → 触发 sentinel report
+        （v1 自然路径不可达，仅防御性兜底；用 monkeypatch 强行触发）"""
+        from backtest_engine.pnl import PnLTracker
+
+        def fake_apply_funding(self, t, current_weights, funding_rates):
+            """Z10 精细 fixture：模拟 1.5 (150%) 总扣款让 V 变负"""
+            self._v_before_funding = self._V
+            self._funding_events[t] = 1.5
+            self._V *= (1.0 - 1.5)   # = -0.5 × initial_V
+            self._funding_applied_at_t = t
+            self._check_bankruptcy(t)
+
+        monkeypatch.setattr(
+            PnLTracker, "apply_funding_settlement", fake_apply_funding,
+        )
+
+        rep = EventDrivenBacktester().run(
+            fixed_gamma_config,
+            reader=fake_reader, signal_store=synthetic_signal_store,
+        )
+
+        # short_period.start = 2024-01-30 00:00:00 UTC，恰是 8h funding event 之一
+        # → 第 1 bar (a) 触发 fake funding → 立即破产 → (a') 早退 → n_recorded=0 → sentinel
+        assert rep.run_metadata["n_bars"] == 0   # sentinel: 无 record
+        assert rep.bankruptcy_timestamp is not None
+        # sentinel weights_history 只有 1 行占位（base.equity_curve.iloc[0] = 破产 V）
+        assert len(rep.base.equity_curve) == 1
+        assert rep.base.equity_curve.iloc[0] < 0   # V 已破产
+        # Z3 字段完整性
+        assert set(rep.cost_breakdown["absolute"].keys()) == {
+            "fee", "spread", "impact", "funding", "total",
+        }
+        # Z10 数值断言（funding_total=1.5）
+        assert rep.cost_breakdown["absolute"]["funding"] == 1.5
+        assert rep.cost_breakdown["share"]["funding"] == 1.0
+
+    def test_sentinel_cost_breakdown_schema_complete(self):
+        """Z3: 直接构造 sentinel report 验证 cost_breakdown 三视图字段完整 + 数值正确
+
+        通过直接调 _build_sentinel_report 而非走 engine.run（更可控）
+        """
+        from backtest_engine.engine import _BacktestDependencies
+        from backtest_engine.pnl import PnLTracker
+        from backtest_engine.config import BacktestConfig, RunMode
+
+        # 构造最小 deps
+        cfg = BacktestConfig(
+            strategy_name="t",
+            symbols=["BTC/USDT", "ETH/USDT"],
+            start=pd.Timestamp("2024-01-01", tz="UTC"),
+            end=pd.Timestamp("2024-01-02", tz="UTC"),
+            run_mode=RunMode.EVENT_DRIVEN_FIXED_GAMMA,
+        )
+        bar_ts = pd.date_range(cfg.start, cfg.end, freq="1min", tz="UTC")
+        tracker = PnLTracker(10000.0)
+        # 模拟首 bar funding 让 V × (1-1.5) = -5000
+        t0 = bar_ts[0]
+        tracker._v_before_funding = tracker._V
+        tracker._funding_events[t0] = 1.5
+        tracker._V *= (1.0 - 1.5)
+        tracker._is_bankrupt = True
+        tracker._bankruptcy_timestamp = t0
+
+        # 最小 deps（仅 sentinel 需要的字段）
+        class _FakeDeps:
+            pass
+        deps = _FakeDeps()
+        deps.bar_timestamps = bar_ts
+        deps.pnl_tracker = tracker
+
+        engine = EventDrivenBacktester()
+        import time
+        rep = engine._build_sentinel_report(cfg, deps, time.monotonic())
+
+        # Z3 schema 完整性
+        assert set(rep.cost_breakdown["absolute"].keys()) == {
+            "fee", "spread", "impact", "funding", "total",
+        }
+        assert set(rep.cost_breakdown["annualized_bp"].keys()) == {
+            "fee", "spread", "impact", "funding", "total",
+        }
+        assert set(rep.cost_breakdown["share"].keys()) == {
+            "fee", "spread", "impact", "funding",
+        }
+
+        # Z10 数值断言
+        assert rep.funding_settlements is not None
+        assert rep.funding_settlements["total_rate"] == 1.5
+        assert rep.funding_settlements["n_events"] == 1
+        assert rep.cost_breakdown["absolute"]["fee"] == 0.0
+        assert rep.cost_breakdown["absolute"]["spread"] == 0.0
+        assert rep.cost_breakdown["absolute"]["impact"] == 0.0
+        assert rep.cost_breakdown["absolute"]["funding"] == 1.5
+        assert rep.cost_breakdown["absolute"]["total"] == 1.5
+        assert rep.cost_breakdown["share"]["fee"] == 0.0
+        assert rep.cost_breakdown["share"]["funding"] == 1.0   # 1.5/|1.5| = +1
+        for k in ("fee", "spread", "impact", "funding", "total"):
+            assert rep.cost_breakdown["annualized_bp"][k] == 0.0
+
+        # 状态字段
+        assert rep.bankruptcy_timestamp == t0
+        assert rep.run_metadata["n_bars"] == 0
+        assert len(rep.base.equity_curve) == 1
+        assert rep.base.equity_curve.iloc[0] < 0   # V 已破产
+
+    def test_sentinel_share_nan_when_funding_total_zero(self):
+        """Z10 边界: funding_total = 0 时 share 全 NaN（与 cost_decomposition 行为一致）"""
+        from backtest_engine.pnl import PnLTracker
+        from backtest_engine.config import BacktestConfig, RunMode
+
+        cfg = BacktestConfig(
+            strategy_name="t",
+            symbols=["BTC/USDT"],
+            start=pd.Timestamp("2024-01-01", tz="UTC"),
+            end=pd.Timestamp("2024-01-02", tz="UTC"),
+            run_mode=RunMode.EVENT_DRIVEN_FIXED_GAMMA,
+        )
+        bar_ts = pd.date_range(cfg.start, cfg.end, freq="1min", tz="UTC")
+        tracker = PnLTracker(10000.0)
+        # funding_events 为空（funding_total=0），但 V 直接置负（极端 fake）
+        tracker._V = -0.001
+        tracker._is_bankrupt = True
+        tracker._bankruptcy_timestamp = bar_ts[0]
+
+        class _FakeDeps:
+            pass
+        deps = _FakeDeps()
+        deps.bar_timestamps = bar_ts
+        deps.pnl_tracker = tracker
+
+        engine = EventDrivenBacktester()
+        import time
+        rep = engine._build_sentinel_report(cfg, deps, time.monotonic())
+
+        import numpy as np
+        # funding_total=0 → denom=0 → share 全 NaN
+        for k in ("fee", "spread", "impact", "funding"):
+            assert np.isnan(rep.cost_breakdown["share"][k]), f"share[{k}] 应为 NaN"
