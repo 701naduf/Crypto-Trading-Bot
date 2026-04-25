@@ -372,6 +372,9 @@ class BacktestReport:
 
         # 3. base
         base_dir = report_dir / "base"
+        # Step 12 / C2: with 块替代裸 open（防 Windows 文件锁定 + GC 依赖）
+        with open(base_dir / "scalars.json", "r", encoding="utf-8") as f:
+            scalars = json.load(f)
         base = BacktestResult(
             equity_curve=_load_value_series(base_dir / "equity_curve.parquet"),
             returns=_load_value_series(base_dir / "returns.parquet"),
@@ -381,7 +384,7 @@ class BacktestReport:
                 _load_value_series(base_dir / "gross_returns.parquet")
                 if (base_dir / "gross_returns.parquet").exists() else None
             ),
-            total_cost=float(json.load(open(base_dir / "scalars.json", "r"))["total_cost"]),
+            total_cost=float(scalars["total_cost"]),
         )
 
         # 4. deviation / regime_stats
