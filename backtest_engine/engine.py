@@ -243,10 +243,11 @@ class EventDrivenBacktester:
             config.start, config.end, freq=pd_freq, tz="UTC",
         )
 
-        # price_panel：用 context_builder 已加载的（避免重复读 reader）
-        price_panel = context_builder._price_panel.reindex(bar_timestamps)
-        # 仅取 config.symbols 列（context 可能含历史预热数据）
-        price_panel = price_panel[list(config.symbols)]
+        # price_panel：通过公开接口 build_panels()["price_panel"]（B3 修订：
+        # 不访问私有 _price_panel，与 _vectorized_cost_breakdown 路径一致）
+        # build_panels() 已切到 eval_bar_index = [start, end]，与 reindex(bar_timestamps) 等价
+        panels = context_builder.build_panels()
+        price_panel = panels["price_panel"][list(config.symbols)]
 
         # funding_rates_panel: 真实 8h 结算面板（每 sym 一个 series 拼成 panel）
         funding_dict = {}
