@@ -4893,7 +4893,6 @@ cvxpy 自动选择合适的求解器，无需手动指定。
 **什么时候用哪个？**
 - 因子研究/策略回测/快速验证 → Phase 2b（快，向量化）
 - 事件驱动回测/模拟盘/实盘 → Phase 2c（精确，动态成本）
-```
 
 ---
 
@@ -4904,6 +4903,925 @@ cvxpy 自动选择合适的求解器，无需手动指定。
 4. 理解从因子到目标权重的完整数据流
 5. 能够独立构建和评估一个量化交易策略
 6. 理解交易成本（手续费 + 市场冲击）对策略绩效的影响
-7. 具备进入 Phase 3（实盘交易系统）的知识基础
+7. 具备进入 Phase 2c（动态成本优化）的知识基础
 
-**祝学习顺利！**
+---
+
+# Phase 3 事件驱动回测引擎 — 代码学习指引
+
+本节是 `backtest_engine/` 模块的代码学习指引。
+这是**研究分支的最后一站**——把前面 4 个 Phase 串成完整的回测流程。
+
+> **学习重点**：与前面 Phase 不同，Phase 3 几乎没有"算法新东西"——它的核心价值是
+> **架构与契约**。学习时请把注意力放在"模块如何协同"、"跨模块契约如何固化"、
+> "fail-fast 如何贯穿"这三件事上，而不是某个具体公式。
+
+## 目录
+
+- [一、模块整体结构（3-1）](#一模块整体结构-3-1)
+- [二、建议学习路线（3-1）](#二建议学习路线-3-1)
+- [三、第 1 站：BacktestConfig 与三模式枚举（config.py）](#三第-1-站backtestconfig-与三模式枚举-configpy)
+- [四、第 2 站：MarketContextBuilder 双模式（context.py）](#四第-2-站marketcontextbuilder-双模式-contextpy)
+- [五、第 3 站：WeightsSource Protocol 抽象（weights_source.py）](#五第-3-站weightssource-protocol-抽象-weights_sourcepy)
+- [六、第 4 站：Rebalancer 执行模拟（rebalancer.py）](#六第-4-站rebalancer-执行模拟-rebalancerpy)
+- [七、第 5 站：PnLTracker 与破产双通道（pnl.py）](#七第-5-站pnltracker-与破产双通道-pnlpy)
+- [八、第 6 站：EventDrivenBacktester 顶层协调（engine.py）](#八第-6-站eventdrivenbacktester-顶层协调-enginepy)
+- [九、第 7 站：attribution 纯函数模块（attribution.py）](#九第-7-站attribution-纯函数模块-attributionpy)
+- [十、第 8 站：BacktestReport 与持久化（report.py）](#十第-8-站backtestreport-与持久化-reportpy)
+- [十一、第 9 站：跨模块护栏（test_consistency.py）](#十一第-9-站跨模块护栏-test_consistencypy)
+- [十二、核心知识点（3-12）](#十二核心知识点-3-12)
+- [十三、与 Phase 2b / 2c 的对比](#十三与-phase-2b--2c-的对比)
+- [十四、设计方法论：4 轮人工审查迭代过程](#十四设计方法论4-轮人工审查迭代过程)
+
+---
+
+## 一、模块整体结构 {#一模块整体结构-3-1}
+
+```
+backtest_engine/
+├── __init__.py              # 公开导出 EventDrivenBacktester / BacktestConfig / BacktestReport / 三模式枚举
+├── config.py                # BacktestConfig (kw_only) + RunMode/ExecutionMode/CostMode + 16 项校验
+├── context.py               # MarketContextBuilder（DataReader → MarketContext + build_panels）
+├── weights_source.py        # WeightsSource Protocol + PrecomputedWeights + OnlineOptimizer
+├── rebalancer.py            # 执行模拟（v1 仅 MARKET）+ ExecutionReport canonical schema
+├── pnl.py                   # P&L 状态中心 + NumericalError fail-fast + 破产双通道
+├── engine.py                # 顶层协调 + 8 项 _validate_environment + (a')/(f) 双早退
+├── attribution.py           # cost_decomposition / deviation_attribution / regime_breakdown / compute_per_symbol_cost
+├── report.py                # BacktestReport 容器 + summary/to_dict + parquet+JSON 原子持久化
+├── plot.py                  # 8 张标准量化回测图
+├── reporting.py             # to_markdown 单文件报告
+└── tests/
+    ├── conftest.py          # 共享 fixtures（FakeDataReader / synthetic_signal_store / ...）
+    ├── test_config.py       # __post_init__ 16 项校验
+    ├── test_context.py      # 双模式 + warmup
+    ├── test_weights_source.py
+    ├── test_rebalancer.py
+    ├── test_pnl.py          # 破产双通道
+    ├── test_engine.py       # _validate_environment + (a')/(f) + 4 项稳健性链路
+    ├── test_attribution.py
+    ├── test_report.py       # save_load 原子化
+    ├── test_plot.py
+    ├── test_reporting.py
+    └── test_consistency.py  # ★ 跨模块/跨模式 数值一致性护栏（rtol=1e-12）
+```
+
+**依赖关系**（单向，不反向）：
+
+```
+backtest_engine.report ◄─── lazy import ─── backtest_engine.attribution
+       ▲                                        ▲
+       │                                        │
+backtest_engine.engine                          │
+       │                                        │
+       ├──► weights_source ──► execution_optimizer (Phase 2c)
+       ├──► rebalancer ──► alpha_model (Phase 2b)
+       ├──► pnl
+       ├──► context ──► factor_research (Phase 2a，间接)
+       └──► (BacktestResult) ──► alpha_model.backtest.performance
+
+         ▼
+data_infra (Phase 1, DataReader)
+```
+
+**关键观察**：`report.py` 不导入 `attribution.py`（只在 `attach_deviation` 内 lazy import）。
+这是**有意设计**——避免 attribution → report 的潜在循环依赖。
+
+---
+
+## 二、建议学习路线 {#二建议学习路线-3-1}
+
+```
+config.py            理解 BacktestConfig + 16 项 __post_init__ 校验
+   │                 重点: fail-fast 前置暴露，不让错误流到事件循环才爆
+   ▼
+context.py           理解双工作模式（批量 build_panels / 逐步 build）
+   │                 重点: 同一上下文构造逻辑服务两种 RunMode
+   ▼
+weights_source.py    理解 Protocol 抽象的力量
+   │                 重点: 把 FIXED_GAMMA / DYNAMIC_COST 的差异收敛到一个接口
+   ▼
+rebalancer.py        理解执行模拟与 ExecutionReport canonical schema
+   │                 重点: cost_mode 自持，不再依赖 engine mediator
+   ▼
+pnl.py               理解混合状态模型 + 破产双通道
+   │                 重点: NaN 必须 fail-fast，不能静默 fillna
+   ▼
+engine.py            理解事件循环时序 + (a')/(f) 双早退
+   │                 重点: 8 项 _validate_environment 前置校验所有环境问题
+   ▼
+attribution.py       理解纯函数模块设计 + 偏差归因方法论
+   │                 重点: ablation 是唯一严格量化偏差源的方式
+   ▼
+report.py            理解 canonical schemas + 持久化原子化
+   │                 重点: parquet + JSON 路线 + tmp + os.replace
+   ▼
+test_consistency.py  理解护栏价值：跨模块一致性如何用 rtol=1e-12 锁定
+                     重点: 4 处 impact 公式必须数值精确等价
+```
+
+**为什么这个顺序**：从配置 → 数据 → 决策 → 执行 → 状态 → 协调 → 分析 → 交付 → 护栏。
+这与事件循环的依赖顺序完全一致——每一站都为下一站提供前提，无前向依赖。
+
+---
+
+## 三、第 1 站：BacktestConfig 与三模式枚举 (config.py)
+
+**核心知识点**: `@dataclass(kw_only=True)` + `__post_init__` 前置校验 + 三个语义不同的枚举
+
+```python
+from backtest_engine import BacktestConfig, RunMode, ExecutionMode, CostMode
+from alpha_model.core.types import PortfolioConstraints
+import pandas as pd
+
+config = BacktestConfig(
+    # A. 标识与范围（必填）
+    strategy_name="momentum_v1",
+    symbols=["BTC/USDT", "ETH/USDT"],
+    start=pd.Timestamp("2026-01-01", tz="UTC"),     # 必须 tz-aware（#15 校验）
+    end=pd.Timestamp("2026-04-01", tz="UTC"),
+    bar_freq="1m",                                   # v1 仅 1m
+
+    # B. 运行模式
+    run_mode=RunMode.EVENT_DRIVEN_DYNAMIC_COST,
+    execution_mode=ExecutionMode.MARKET,             # v1 仅 MARKET
+    cost_mode=CostMode.FULL_COST,                    # 或 MATCH_VECTORIZED
+
+    # C. 资金管理
+    initial_portfolio_value=10_000.0,                # > 0（#7）
+
+    # D. 组合优化参数
+    constraints=PortfolioConstraints(...),           # DYNAMIC_COST 必填（#1）
+    optimize_every_n_bars=5,                          # >= 1（#13）
+
+    # F. 可选分析
+    regime_series=my_regime_series,                  # tz-aware DatetimeIndex（#16）
+)
+```
+
+**16 项校验清单**（重点行 config.py:120-180）：
+
+| 类别 | 校验 | 失败行为 |
+|------|------|--------|
+| 致命（影响结果）| start<end / V>0 / 期间内 ... | `ValueError` |
+| 未实现（v1 限制）| bar_freq=="1m" / execution_mode==MARKET / time_convention=="bar_close" | `NotImplementedError` |
+| 静默冗余（用户误传但无害）| VECTORIZED+MATCH_VECTORIZED 是 no-op / FIXED_GAMMA+constraints | `logger.warning` |
+
+**学习要点**：
+1. **为什么 kw_only**：20+ 字段，位置参数不可记；强制关键字传参让调用自解释
+2. **为什么 16 项校验在 `__post_init__`**：让错误在构造时立即暴露，不流到事件循环 N 个 bar 之后才爆
+3. **为什么三个枚举**：决策层（RunMode）/ 执行层（ExecutionMode）/ 成本层（CostMode）三个正交维度，各自独立扩展
+
+**重点行**: config.py:60-110 字段定义。config.py:120-180 校验清单。
+
+---
+
+## 四、第 2 站：MarketContextBuilder 双模式 (context.py)
+
+**核心知识点**: 同一上下文构造逻辑服务两种 RunMode（批量 vs 逐步）
+
+```python
+# context.py 的核心矛盾：
+# - VECTORIZED 模式需要"整段时间的面板"（spread_panel / adv_panel / vol_panel）
+# - 事件驱动模式需要"逐 bar 的 MarketContext 快照"
+#
+# 解法：MarketContextBuilder 暴露两个方法，**复用同一份底层数据加载逻辑**
+#
+# build(t, current_w, V) → MarketContext     # 逐步模式
+# build_panels()         → dict[str, DataFrame]  # 批量模式
+
+builder = MarketContextBuilder(reader, config)
+
+# 事件驱动模式（每 bar 一次）
+ctx = builder.build(t, current_w, pnl_tracker.portfolio_value)
+# ctx.spread / ctx.volatility / ctx.adv / ctx.portfolio_value / ctx.funding_rate
+
+# VECTORIZED 模式（一次产出全部）
+panels = builder.build_panels()
+# {"price_panel", "spread_panel", "adv_panel", "vol_panel"}
+# keys 严格带 _panel 后缀（与 compute_per_symbol_cost 形参对齐，详见 §12.6）
+```
+
+**学习要点**：
+1. **批量 vs 逐步的决策**：批量便于 vectorized_backtest 一次性算；逐步便于事件循环每 bar 注入实时状态
+2. **warmup 期处理**：rolling 窗口需要至少 21 天历史数据才能算出有效 σ 和 ADV；MarketContextBuilder 在 `__init__` 时就预加载这段数据
+3. **canonical key 命名**：`spread_panel / adv_panel / vol_panel` 带 `_panel` 后缀，使
+   `compute_per_symbol_cost(**panels, ...)` 解包合法
+
+**反思**：早期设计里 keys 写过 `{"spread", "adv", "vol"}`（无后缀），第二轮人工审查发现
+`**report.context_panels` 解包会因形参名不匹配而 TypeError。是教科书级的"跨模块隐性
+约定"bug——固化到 docs/phase3_design.md §12.6 后才彻底消除。
+
+**重点行**: context.py 的 `build()` 与 `build_panels()` 两个方法签名 + warmup 校验逻辑。
+
+---
+
+## 五、第 3 站：WeightsSource Protocol 抽象 (weights_source.py)
+
+**核心知识点**: Python `Protocol`（`@runtime_checkable`）实现"决策来源"的零耦合抽象
+
+```python
+# 设计动机：
+# FIXED_GAMMA 模式 → 重放预计算的 weights_panel（没有"决策"，只是查表）
+# DYNAMIC_COST 模式 → 每 bar 调 ExecutionOptimizer.optimize_step（动态决策）
+#
+# 两者在事件循环里的接口完全相同：给定 t / current_w / context / price_history → target_w
+# 用 Protocol 把它们统一为同一个接口
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class WeightsSource(Protocol):
+    def get_target_weights(
+        self, t, current_weights, context, price_history,
+    ) -> pd.Series: ...
+
+# 两个实现:
+class PrecomputedWeights:
+    """FIXED_GAMMA 模式：忽略 current_weights / context / price_history，直接查 weights_panel.loc[t]"""
+
+class OnlineOptimizer:
+    """DYNAMIC_COST 模式：调 ExecutionOptimizer.optimize_step（cost_mode 自持）"""
+
+    def __init__(self, optimizer, signals_panel, cost_mode):
+        # cost_mode 自持是关键设计（v1 修订）：
+        # 早期方案是 engine 在调 optimizer 前 mutate context.spread → 0
+        # 修订方案是 OnlineOptimizer 内部判断 cost_mode 并 replace(context, spread=0)
+```
+
+**学习要点**：
+1. **Protocol 比 ABC 更现代**：不强制继承；structural subtyping；与 Python 类型系统天然集成
+2. **PrecomputedWeights 忽略 3 个参数是有意的**：FIXED_GAMMA 的语义是"如实重放预算策略"，不应受当前状态影响。这种"故意忽略"在 docstring 里要明示，否则 reader 会困惑
+3. **cost_mode 自持的演化**：从"engine mediator"重构为"消费方各自持有"消除了跨模块隐性约定。这是**第 4 轮人工审查的关键修订**
+
+**重点行**: weights_source.py 的 Protocol 定义 + PrecomputedWeights 的 `__init__` schema 校验 + OnlineOptimizer 的 `cost_mode` 处理分支。
+
+---
+
+## 六、第 4 站：Rebalancer 执行模拟 (rebalancer.py)
+
+**核心知识点**: ExecutionReport canonical schema + cost_mode 自持的实现
+
+```python
+# Rebalancer 是"执行现实"的模拟器：
+# 输入: target_w（决策层产出）+ current_w（当前持仓）+ context（市场状态）
+# 输出: actual_w（实际成交后的持仓）+ ExecutionReport（成本明细）
+
+# v1 仅 MARKET 模式（瞬时按 close 价成交）；LIMIT/TWAP 推 v2
+
+@dataclass
+class ExecutionReport:
+    """跨模块契约（详见 docs/phase3_design.md §12.1）"""
+    timestamp: pd.Timestamp                # 与事件循环 t 一致
+    actual_delta: pd.Series                # actual_w - current_w
+    trade_values: pd.Series                # |actual_delta| × V
+    fee_cost: float                        # 收益率空间
+    spread_cost: float                     # MATCH_VECTORIZED 模式下恒 0
+    impact_cost: float                     # (2/3)·coeff·σ·√(V/ADV)·|Δw|^1.5
+    filtered_symbols: list[str]            # 被 min_trade_value 过滤的 symbol
+
+# 三分量成本（Step 3 in execute()）：
+fee_cost    = fee_rate × Σ|actual_delta|
+if self._cost_mode == CostMode.MATCH_VECTORIZED:
+    spread_cost = 0.0                      # 与 vectorized_backtest(spread_panel=None) 对齐
+else:
+    spread_cost = Σ(spread[i]/2 × |actual_delta[i]|)
+impact_cost = (2/3) × Σ(coeff × σ[i] × √(V/ADV[i]) × |actual_delta[i]|^1.5)
+```
+
+**学习要点**：
+1. **canonical schema 的力量**：`ExecutionReport` 7 字段冻结后，PnLTracker 才能放心用 `exec_report.fee_cost`，不必担心 Rebalancer 哪天改字段名
+2. **MATCH_VECTORIZED 的 spread=0 是模式语义**：让 FIXED_GAMMA 和 VECTORIZED 在 spread 这一项对齐，便于偏差拆解
+3. **ADV 兜底 `np.maximum(adv, 1.0)`**：与 cost.py / vectorized.py / per_symbol 重算共 4 处保持一致；任一处不一致会让护栏测试失败
+
+**重点行**: rebalancer.py:46-72 ExecutionReport 定义。rebalancer.py:180-220 三分量成本（含 cost_mode 分支）。
+
+---
+
+## 七、第 5 站：PnLTracker 与破产双通道 (pnl.py)
+
+**核心知识点**: 混合状态模型（循环内时序敏感 + 循环后向量化）+ NaN fail-fast
+
+```python
+# PnLTracker 是 Phase 3 唯一持有 portfolio_value 的模块。
+# 设计哲学（混合模式 E.2）：
+#
+# 循环内（时序敏感）：
+#   _V                          # 当前 V，每 bar 更新
+#   _v_before_funding           # funding 扣款前的 V（精确公式 base_V）
+#   _funding_applied_at_t       # 显式标志（v2 修订：替代 dict-as-flag 隐式语义）
+#   _fee_series, _spread_series, _impact_series   # dict[t, float] 累积
+#   _funding_events             # dict[t, float] 累积
+#
+# 循环后（向量化）：
+#   compute_backtest_result()   # 一次性算 equity_curve / returns / 12 项绩效
+
+# 破产双通道（v3 关键修订）：
+def _check_bankruptcy(self, t):
+    # 通道 1: V 是 NaN/Inf → 数据/公式 bug，立即抛 NumericalError
+    if not np.isfinite(self._V):
+        raise NumericalError(
+            f"V 变为 {self._V} at t={t}。可能原因：context.spread/funding/adv NaN。"
+        )
+    # 通道 2: V ≤ 0 finite → 策略真破产，标志位 + bankruptcy_timestamp，事件循环 break
+    if self._V <= 0 and not self._is_bankrupt:
+        self._is_bankrupt = True
+        self._bankruptcy_timestamp = t
+        logger.warning(f"破产事件，t={t}, V={self._V:.2f}")
+```
+
+**为什么 NaN 必须 fail-fast**（v3 修订前的旧 bug）：
+
+```python
+# 旧版：if V <= 0 → NaN <= 0 返回 False → bankruptcy 不触发
+# 后果：V=NaN 后所有后续 bar 都是 NaN，回测继续跑直到 end，
+#       用户拿到全 NaN 的 BacktestReport 毫无察觉。
+#
+# 修订：np.isfinite(V) 检测 NaN/Inf → 立即抛 NumericalError → 事件循环中止
+#
+# 这种 bug 在多个量化框架历史上反复出现（数据 gap → spread NaN → cost NaN → V NaN）。
+# 设计哲学：宁可 fail-fast 让用户重跑，也不静默吞 NaN 让用户拿到错误结果。
+```
+
+**学习要点**：
+1. **混合模式 vs 严格两阶段**：严格两阶段会让 impact 估计用 initial_V 近似（不反映策略大幅盈亏）；
+   混合模式额外计算量极小（每 bar 几个标量乘法），换精确 impact 估计
+2. **funding 事件即时扣 V**：让下一步 context 用 funding 后的 V，符合现实
+3. **`_funding_applied_at_t` 显式标志**：第 4 轮审查后引入，替代 `t in self._funding_events`
+   隐式 dict-as-flag 语义。两者数学等价但显式更易调试
+4. **破产双通道的语义差异**：
+   - V≤0 finite = 策略问题，需要看 equity_curve 截断分析"什么时候亏光的" → 标志位
+   - V=NaN/Inf = 系统问题，不是策略错，要求用户修数据 → 抛异常
+
+**重点行**: pnl.py:200-225 `_check_bankruptcy` 双通道。pnl.py:130-180 `record()` 精确 V 更新公式。
+
+---
+
+## 八、第 6 站：EventDrivenBacktester 顶层协调 (engine.py)
+
+**核心知识点**: 事件循环 7 步 + 8 项 _validate_environment + (a')/(f) 双早退
+
+```python
+# 事件循环每 bar：
+for i, t in enumerate(bar_timestamps):
+
+    # (a) Funding 事件检测与扣款
+    if t in deps.funding_rates_panel.index:
+        funding_rates_at_t = deps.funding_rates_panel.loc[t]
+        deps.pnl_tracker.apply_funding_settlement(t, current_w, funding_rates_at_t)
+
+    # (a') 早退 1: funding 触发真实破产（V≤0 finite）
+    # 注：V=NaN/Inf 由 _check_bankruptcy 直接抛 NumericalError，不走这里
+    if deps.pnl_tracker.is_bankrupt:
+        break
+
+    # (b) 构造市场状态（保持 raw；cost_mode 由 Rebalancer/OnlineOptimizer 各自处理）
+    context = deps.context_builder.build(t, current_w, deps.pnl_tracker.portfolio_value)
+
+    # (c) 决策（按 optimize_every_n_bars 控制频率）
+    is_dynamic = (config.run_mode == RunMode.EVENT_DRIVEN_DYNAMIC_COST)
+    if (not is_dynamic) or (i % config.optimize_every_n_bars == 0):
+        target_w = deps.weights_source.get_target_weights(t, current_w, context, prices[:t])
+        last_target_w = target_w
+    else:
+        target_w = last_target_w   # 沿用上次
+
+    # (d) 执行模拟（每 bar 都跑）
+    actual_w, exec_report = deps.rebalancer.execute(current_w, target_w, context, prices.loc[t])
+
+    # (e) 记录（每 bar 都跑）
+    deps.pnl_tracker.record(t, actual_w, prices.loc[t], exec_report)
+    current_w = actual_w
+
+    # (f) 早退 2: record 触发破产（execution cost 压垮 V）
+    if deps.pnl_tracker.is_bankrupt:
+        break
+```
+
+**8 项 _validate_environment 校验**（fail-fast 前置暴露环境问题）：
+
+| # | 校验 | 防止 |
+|---|------|----|
+| 1 | SignalStore 含 strategy | FileNotFoundError 在事件循环中爆 |
+| 2 | weights/signals columns ⊇ symbols | KeyError 在第 1 个 bar 爆 |
+| 3 | SignalStore 时段覆盖 | 事件循环中拿不到 weights |
+| 4 | DataReader 数据含 21 天热身期 | warmup 不够导致 σ/ADV 全 NaN |
+| 5 | DYNAMIC_COST 模式 funding 数据存在 | optimizer 跑一半发现 funding=None 报错 |
+| 6 | bar_timestamps tz == funding_rates_panel.index tz | tz mismatch 静默漏扣 funding |
+| 7 | price_panel.index ⊇ bar_timestamps | weights_history 算 returns 时 NaN |
+| 8 | price_panel 推断频率 == config.bar_freq | impact 公式 bars_per_day 算错 |
+
+**学习要点**：
+1. **engine 无状态**：`run()` 多次调用等价于新建实例，无 leak 风险
+2. **依赖装配集中在 `_build_dependencies`**：用 `_BacktestDependencies` dataclass 打包，让事件循环只需收一个 `deps` 参数
+3. **(a')/(f) 双早退的必要**：funding 触发破产时，本 bar 后续 (b)-(e) 会用负 V 构造 context，
+   impact 公式 √(V/ADV) 直接报错或产 NaN，污染 weights_history
+4. **`optimize_every_n_bars` 加速**：跳决策不跳记录——Rebalancer 仍按本 bar 最新 current_w
+   算 Δw，每 bar 都有真实成交、cost 累积、PnL 更新
+
+**重点行**: engine.py:480-580 事件循环主体。engine.py:170-260 _validate_environment 8 项校验。
+
+---
+
+## 九、第 7 站：attribution 纯函数模块 (attribution.py)
+
+**核心知识点**: 纯函数模块设计 + 偏差归因方法论 + ablation
+
+```python
+# attribution.py 是 Phase 3 的"高价值产出"模块。
+# 把 PnLTracker 内部状态加工成对用户有意义的洞察：
+#
+#  1. cost_decomposition()   "我的钱去哪了？" — fee/spread/impact/funding 分解
+#  2. deviation_attribution() "事件驱动 vs 理想执行差多少？为什么差？" — 偏差拆解表
+#  3. regime_breakdown()      "在不同市场环境下表现如何？" — regime 分段统计
+#  4. compute_per_symbol_cost() "哪个 symbol 最贵？" — 按需重算 per-symbol cost
+
+# 设计选择：
+#   - 纯函数模块（无 class、无状态、无副作用）
+#   - 不内部触发回测（避免循环依赖；ablation 由用户/上层组织）
+#   - cost_decomposition 通过 PnLTracker public properties 取数（不访问 _xxx_series 私有）
+```
+
+**偏差归因（deviation_attribution）的核心思想**：
+
+```python
+# vectorized_backtest 是"理想执行"基准（无 funding、固定 V、瞬时无摩擦执行）
+# event_driven 是"现实执行"（含 funding / 动态 V / 最小下单量过滤 / impact）
+#
+# 总差 = vectorized_terminal - event_driven_terminal
+#
+# 已知偏差源：
+#   - min_trade_value 过滤
+#   - funding 事件
+#   - 动态 V 更新
+#   - optimize_every_n_bars 加速
+#   - 强平不建模（v1 已知乐观偏差）
+#
+# 量化方法：ablation
+#   关闭某个偏差源再跑一次 → 差值就是该项贡献
+#   funding 项可用 first-order 近似免 ablation：delta ≈ -sum(funding_events)
+#
+# v1 双模式：
+#   P1 默认（无 ablation）：仅列项 + 总差实测 + funding 一阶近似
+#   P2（用户传 ablation_results=...）：精确量化各项贡献
+```
+
+**学习要点**：
+1. **为什么 attribution 不内部触发回测**：避免循环依赖（attribution → engine → attribution）；
+   ablation 触发 N 次额外回测（每次 ~3.5h），必须用户显式确认
+2. **ablation 是唯一严格量化偏差的方式**：偏差源之间不独立（funding → V → impact → actual_w → 下次 funding...），
+   解析公式只在独立时严格成立
+3. **funding 一阶近似的合理性**：在 net 公式里 funding 是独立项，二阶效应（V → impact → actual_w）
+   在 funding 总扣款率 < 1% 时 < 0.01% 量级
+4. **`compute_per_symbol_cost` 用 `v_at_bar_open_history`**：与 Rebalancer 用同一 V 算 impact，
+   达到 rtol=1e-12 严格相等
+
+**重点行**: attribution.py:135-310 deviation_attribution 完整逻辑。attribution.py:455-540 compute_per_symbol_cost 公式。
+
+---
+
+## 十、第 8 站：BacktestReport 与持久化 (report.py)
+
+**核心知识点**: 12 个 canonical schemas + parquet+JSON 原子持久化
+
+```python
+@dataclass
+class BacktestReport:
+    base: BacktestResult                         # 12 项绩效（Phase 2b 字段）
+    config: BacktestConfig                        # 配置快照（reproducibility）
+    cost_breakdown: dict[str, dict[str, float]]   # absolute/annualized_bp/share
+    deviation: pd.DataFrame | None                # 偏差拆解表
+    regime_stats: pd.DataFrame | None             # regime 分段
+    funding_settlements: dict | None              # 5 keys 统计
+    bankruptcy_timestamp: pd.Timestamp | None
+    run_metadata: dict                            # 9 keys（含 schema_version）
+    context_panels: dict | None = None            # B3 跨机器分发可选
+
+    def summary(self) -> dict: ...                # 20 keys
+    def __repr__(self) -> str: ...                # ~20 行摘要
+    def save(self, report_dir, *, context_builder=None) -> None: ...    # 原子化
+    def load(cls, report_dir) -> "BacktestReport": ...
+    def attach_deviation(self, vec_result, ablation_results=None): ...  # lazy import
+    def plot(self, *, figsize=(16, 10)): ...      # 委托 plot_all
+    def to_markdown(self, output_dir, ...): ...   # 委托 reporting
+```
+
+**save 的原子化设计**（v3 修订）：
+
+```python
+def save(self, report_dir, *, context_builder=None):
+    # 1. 写入 tmp_dir = report_dir.tmp_{uuid}
+    tmp_dir = Path(f"{report_dir}.tmp_{uuid.uuid4()}")
+    tmp_dir.mkdir(...)
+    # ... 全部写入 tmp_dir/* ...
+
+    # 2. 原子化重命名（同一文件系统下 atomic）
+    try:
+        os.replace(tmp_dir, report_dir)
+    except OSError:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+```
+
+**为什么必须原子化**：旧设计 10+ 文件分步写，磁盘满 / 进程崩溃会留半成品，
+下次 load 默默读到不完整数据。这是隐性 bug 的源头。
+
+**学习要点**：
+1. **组合优于继承**：`BacktestReport` 持有 `BacktestResult`（不继承），`summary()` 透传保持
+   Phase 2b 12 项接口不变
+2. **canonical schemas 单一来源**：12 个 dict-like / DataFrame 的 keys 列表全部固化在
+   docs/phase3_design.md §12，跨模块契约只此一处定义
+3. **parquet + JSON 路线 vs pickle**：pickle 跨 Python/pandas 版本兼容性差；parquet 是
+   columnar 标准，pandas/polars/spark 都能读，长期可用
+4. **`schema_version` 演进控制**：`load` 时校验主版本兼容性（"1.0"），为 v2 演进留迁移空间
+5. **`attach_deviation` 的 lazy import**：防潜在 attribution → report 循环依赖
+
+**重点行**: report.py:60-90 字段定义。report.py:230-330 save 原子化实现。
+
+---
+
+## 十一、第 9 站：跨模块护栏 (test_consistency.py)
+
+**核心知识点**: 单测作为质量护栏 + rtol=1e-12 严格断言
+
+这一站没有源码，只有测试。但**它是整个 Phase 3 最重要的设计文档之一**——
+它把"无策略可上线，无法集成测试"的现实下的核心质量保证机制具体化。
+
+```python
+# test_consistency.py 三个 TestClass：
+
+class TestZeroFrictionEquivalence:
+    """关闭所有摩擦后，FIXED_GAMMA 与 VECTORIZED 在 rtol=1e-12 下逐 bar 严格相等"""
+    def test_returns_strict_equality(): ...        # rtol=1e-12, atol=1e-15
+    def test_equity_strict_equality(): ...          # 归一化处理 V0 差异
+    def test_cost_breakdown_components_zero(): ...
+
+class TestPerSymbolCostSumsToPortfolioViaEngine:
+    """compute_per_symbol_cost 加总 == cost_decomposition portfolio total"""
+    # 通过 monkeypatch 捕获 engine 内部 PnLTracker，重建 panels 后验证恒等
+
+class TestImpactFormulaFourPathsConsistency:
+    """impact 公式四处实现两两 rtol=1e-12 相等"""
+    # path 1: alpha_model.backtest.vectorized.estimate_market_impact
+    # path 2: execution_optimizer.cost.build_cost_expression (cvxpy)
+    # path 3: backtest_engine.rebalancer.Rebalancer (np scalar)
+    # path 4: backtest_engine.attribution.compute_per_symbol_cost (panel)
+    # 给定相同输入，四条路径必须数值精确相等
+```
+
+**学习要点**：
+1. **护栏的价值**：任何后续修改 impact 公式 / cost_mode 分支 / per_symbol 重算时，
+   护栏立即失败。这是"未来重构破坏 invariant"的回归保护
+2. **fixture 的精巧设计**：
+   - `zero_first_bar_signal_store`：让 weights.iloc[0] = 0，对齐 vec dropna 与 ed 首 bar gross=0
+   - `no_funding_reader`：完全去 funding（vec 不处理 funding，必须剥离才能 1e-12）
+   - `patch_context_builder`：vol_min_periods=200 适配短时段合成数据
+3. **`pytest.raises(..., match="...")` 的具体性**：所有错误路径测试都用 match 校验消息，
+   防回归时把 ValueError 误捕获为其他无关异常
+4. **monkeypatch 的克制使用**：仅在需要捕获内部状态（PnLTracker）或注入异常路径时使用
+
+**这是整个研究分支最值得反复阅读的测试文件**——它体现了"无集成测试条件下，单测如何
+做到与集成测试同等可信任度"的方法论。
+
+**重点行**: test_consistency.py:140-250 三个 TestClass 完整实现。
+
+---
+
+## 十二、核心知识点 {#十二核心知识点-3-12}
+
+### 12.1 Protocol vs ABC vs duck typing
+
+| 维度 | duck typing | ABC | Protocol |
+|------|------------|-----|--------|
+| 类型检查 | 无 | 强制继承 | structural（无需继承）|
+| 用法 | 隐式约定 | `class X(BaseClass)` | `@runtime_checkable` |
+| sklearn 兼容 | ✓ | ✗（要继承）| ✓ |
+| 静态类型工具 | 无 | 部分 | 完整（mypy/pyright）|
+
+Phase 2b `AlphaModel` 与 Phase 3 `WeightsSource` 都用 Protocol——为了让用户/上游
+策略零侵入接入，不强制继承基类。
+
+### 12.2 混合状态模型 vs 严格两阶段
+
+| 模型 | 优势 | 劣势 |
+|------|----|------|
+| 严格两阶段（先收集事件，再批量算）| 概念干净 | impact 估计用 initial_V，不反映策略大幅盈亏 |
+| **混合模式**（v1 选择）| 时序敏感状态（V/funding）循环内维护，绩效循环后向量化 | 实现略复杂 |
+
+PnLTracker 的"混合模式 E.2"是这个权衡的具体实现。
+
+### 12.3 Fail-fast vs Defensive programming
+
+Phase 3 的核心设计哲学：**暴露潜在错误，拒绝静默错误**。
+
+| 类别 | Defensive 写法 | Fail-fast 写法（Phase 3 选择）|
+|------|--------------|----------------|
+| NaN 在 V 中 | `V = np.nan_to_num(V, 0)` | `raise NumericalError(...)` |
+| funding tz 不一致 | `_funding_events.get(t, 0.0)` 隐性吞掉 | `_validate_environment` 抛 `ValueError` |
+| price_panel 缺索引 | `pct_change().fillna(0)` | `_validate_environment` 抛 `ValueError` |
+| 未知 cost_mode | `else: spread_cost = 0` 默认 | `__post_init__` 抛 `ValueError` |
+
+**为什么 fail-fast 更好**：Defensive 写法让用户回测半小时后拿到看似正常的结果，
+实际全是 NaN（多个量化框架历史上反复出现的 bug）。Fail-fast 让用户立即知道
+环境有问题，修了再重跑。
+
+### 12.4 跨模块隐性约定的危害与消除
+
+**典型隐性约定**：早期 cost_mode 处理设计。
+
+```python
+# 隐性约定方案（已弃用）：
+# engine 在 _apply_cost_mode 中 mutate context.spread → 0
+# Rebalancer 和 OnlineOptimizer 都假设 "context 已被 engine 处理过"
+#
+# 风险：若 engine 调用顺序漂移、被遗漏，optimizer 与 Rebalancer 各扣一次 spread
+#       → 静默 bug，无运行时护栏
+
+# 消除方案（v1 修订）：cost_mode 由消费方各自持有
+# Rebalancer.__init__(cost_mode=...) → 内部判断
+# OnlineOptimizer.__init__(cost_mode=...) → 内部判断
+# engine 完全不 mutate context
+```
+
+**学到的方法论**：跨模块"约定"如果只靠 docstring，迟早出 bug。要么固化到 canonical
+schema（如 ExecutionReport），要么消除到各模块自洽（如 cost_mode 重构）。
+
+### 12.5 Canonical schemas 的力量
+
+docs/phase3_design.md §12 集中固化了 12 个跨模块契约：
+
+```
+12.1 ExecutionReport         12.7 funding_settlements
+12.2 MarketContext           12.8 run_metadata
+12.3 PnLTracker properties   12.9 deviation columns
+12.4 funding 命名分离        12.10 regime_stats columns
+12.5 cost_breakdown keys     12.11 summary keys
+12.5' cost_series keys       12.12 持久化目录 layout
+12.6 context_panels keys
+```
+
+**任何字段变化必须先改本节再改实现**。这是"single source of truth"原则的具体落地——
+避免"PnLTracker 的 fee_series 是 dict 还是 Series"这种问题在 5 个文件之间各执一词。
+
+---
+
+## 十三、与 Phase 2b / 2c 的对比
+
+| 维度 | Phase 2b PortfolioConstructor | Phase 2c ExecutionOptimizer | Phase 3 EventDrivenBacktester |
+|------|-------------------------------|---------------------------|-------------------------------|
+| 角色 | 决策（向量化批处理）| 决策（事件驱动单步）| 协调（决策 + 执行 + P&L + 分析）|
+| 输入 | 整个回测期的因子面板 | 单 bar 的 signals + context | BacktestConfig |
+| 输出 | 整个回测期的权重面板 | 单 bar 的 target_w | BacktestReport（含 12 项绩效 + 偏差拆解 + regime + 持久化）|
+| 成本模型 | 固定 γ‖Δw‖₁ | 动态 cost(Δw, MarketContext) | 通过 cost_mode 切换 |
+| 速度 | 秒级 | 单步 ms 级 | 半年回测 ~3.5h（DYNAMIC_COST, N=1）|
+| 测试规模 | 191 项 | 36 项 | 219 项（含 9 项 rtol=1e-12 护栏）|
+
+**三者的关系**：
+- Phase 2b 和 Phase 2c 是**互斥的决策模块**（同一时刻只用一个）
+- Phase 3 是**协调器**：通过 `WeightsSource` Protocol 把它们抽象到同一接口
+- 用户只需切 `RunMode` 一个字段，无需学三套 API
+
+---
+
+## 十四、设计方法论：4 轮人工审查迭代过程
+
+> 这一节是 Phase 3 学习材料中**最特别的部分**——记录了一个真实的"设计 → 审查 → 修订"
+> 完整循环。如果你只能从 Phase 3 学一件事，那应该是这个迭代方法论。
+
+### 第 1 轮：设计文档完成（4500 行 docs/phase3_design.md）
+
+完成 10 个子模块设计（§11.1-§11.10）+ 12 个 canonical schemas（§12）。
+设计期间已含 3 轮 supervisor 自检，找到并修复了 7 个 critical 问题（含 BacktestReport 字段
+不一致、deviation populate 路径漏洞、events.py 死代码等）。
+
+### 第 2 轮：第一次人工审查 — 发现 7 个新 bug
+
+用户审查发现 7 个 cross-cutting issues：
+- to_markdown 签名透传 / spread_panel=None 语义 / cost_mode 单点护栏 / regime cost 公式
+- ExecutionReport canonical 章节、funding_events 二义性、ffill 语义对比
+
+**关键修订**：cost_mode 从 engine mediator 重构为消费方各自持有（消除跨模块隐性约定）。
+
+### 第 3 轮：第二次人工审查 — 又发现 5 个矛盾
+
+NaN 语义在 4 个边界表中未同步 v3 fail-fast 修订；伪代码用了短名违反 §10.0 约定；
+(a') 注释措辞不精确等。
+
+### 第 4 轮：第三次人工审查 — 最严重 bug
+
+发现 §12.2 MarketContext schema 严重错误（`vol_daily` 应是 `volatility`，幻造 `current_weights / cov_estimate`）。这是个**直接误导 coder 实现非法字段访问**的 bug，被埋在"canonical 单一来源"
+里更危险。
+
+### 第 5 轮：实现审查 — 发现测试缺口
+
+实现层 100% 匹配设计（10 个子模块 / 12 个 schema / 8 个跨模块一致性 / fail-fast 路径全部到位），
+但测试层有显著缺口：
+- test_consistency.py 缺失 → 弱化为 rtol=0.05 + 仅 fee 分量
+- _validate_environment 3 项校验无单测（B3/B4/B5）
+- NumericalError engine 层传播测试缺
+- funding tz mismatch / NaN 链路测试缺
+
+补完后，测试护栏才真正达到设计预期。
+
+### 学到的方法论
+
+1. **设计文档必须有 canonical schema 集中章节**：跨模块契约散落各处必出 bug
+2. **审查是"螺旋式"的**：每一轮都会发现新 bug，但每一轮发现的 bug 越来越细微
+3. **承认"剩余 bug 越来越难仅靠读 doc 发现"**：第 5 轮起，"编译器/单测"是更高效的 bug 发现工具
+4. **"不降级、不妥协"原则贯穿**：发现问题就修，不"v2 再说"。但承认有 trade-off 时显式标注（如 v1 不建模强平）
+5. **fail-fast 不只是异常处理风格，是设计哲学**：让所有上游环境问题、数据 bug、公式漂移都
+   在最早暴露点立即抛错，绝不静默继续
+
+**这套方法论可以迁移到任何复杂模块的设计**——不限于回测引擎。
+
+---
+
+**Phase 3 学习完成后，你应该具备：**
+1. 理解 Protocol 抽象如何把"决策来源"统一到一个接口
+2. 理解混合状态模型 vs 严格两阶段的取舍
+3. 理解 Fail-fast vs Defensive programming 的设计哲学
+4. 理解 canonical schemas 如何固化跨模块契约
+5. 理解事件循环时序与破产双通道
+6. 理解 ablation 是严格量化偏差归因的唯一方式
+7. 理解单测护栏（rtol=1e-12）在无集成测试场景下的核心价值
+8. 理解"设计 → 审查 → 修订"螺旋迭代的方法论
+9. **具备进入 Phase 4（实盘交易系统）的知识基础**
+
+---
+
+# 终章：研究分支完成 — 整体回顾与方法论沉淀
+
+> 这一章不是技术指引，是**对整个研究分支开发过程的回忆与反思**。
+> 写给未来某天回看这个项目的你——希望帮你快速找回当时的思考脉络。
+
+## 一、五个 Phase 完成的整体感悟
+
+```
+Phase 1  data_infra        125 项测试    数据采集 + 存储 + 读取
+Phase 2a factor_research   200 项测试    因子计算 + 评价 + FactorStore
+Phase 2b alpha_model       191 项测试    因子→权重 全链路 + AlphaPipeline
+Phase 2c execution_optimizer 36 项测试   动态成本单步优化（事件驱动版 PortfolioConstructor）
+Phase 3  backtest_engine   219 项测试    事件驱动回测协调（含 9 项 rtol=1e-12 护栏）
+                          ────────────
+                          771 项测试
+```
+
+**回看 5 个 Phase 的演化**：
+- Phase 1 学的是"工程基础"——异步采集、多种数据格式、原子写入、容错
+- Phase 2a 学的是"研究范式"——因子化思维、IC/IR、参数族、对齐
+- Phase 2b 学的是"建模框架"——Protocol 抽象、Walk-Forward、cvxpy 凸优化
+- Phase 2c 学的是"执行细节"——动态成本、SOCP、事件驱动 vs 向量化
+- Phase 3 学的是"系统设计"——架构、契约、fail-fast、护栏方法论
+
+**最大的收获不是某个具体技术，而是**：意识到"量化策略的代码 95% 是基础设施"。
+真正的 alpha 信号可能只是 100 行因子计算，但要让它跑出可信的回测结果，需要前面
+4500 行设计文档 + 10 个模块 + 700+ 测试的支撑。
+
+## 二、跨 Phase 设计抽象的演化
+
+研究分支有一条贯穿始终的"持久化层演化"线索：
+
+```
+Phase 1  →  data_infra/db/*.sqlite + parquet     (raw data)
+Phase 2a →  FactorStore (db/factors/*.parquet)   (factor panels)
+Phase 2b →  SignalStore (db/signals/*.parquet)   (strategy outputs)
+            ModelStore  (db/models/*.pkl)         (trained models)
+Phase 3  →  BacktestReport (parquet + JSON)       (analysis artifacts)
+```
+
+每一层的抽象都比前一层更高。`FactorStore` 是"因子结果"，`SignalStore` 是"策略结果"，
+`BacktestReport` 是"分析结果"。**职责清晰、向上抽象、单向依赖**——这是好架构的标志。
+
+另一条线索是"决策来源的演化"：
+
+```
+Phase 2b PortfolioConstructor (向量化批处理决策)
+   │
+   ▼
+Phase 2c ExecutionOptimizer (事件驱动单步决策)
+   │
+   ▼
+Phase 3 WeightsSource Protocol (统一决策来源抽象)
+   │  ├── PrecomputedWeights → 重放 Phase 2b 输出
+   │  └── OnlineOptimizer → 调 Phase 2c
+```
+
+Protocol 抽象的力量在这里彻底显现：**用户切 RunMode 一个字段，不学三套 API**。
+
+## 三、设计文档的价值
+
+`docs/` 目录最终积累了 34 份文档，涵盖：
+- 各 phase 设计决策（phase3_design.md 4700+ 行是最大的一份）
+- 各 phase preparation / debug 记录
+- ultrareview 多轮审查记录
+
+**重新审视这些文档的价值**：
+1. **不是为了"将来给别人看"**——而是为了"将来给自己看"。3 个月后回看代码，
+   docstring 只能告诉你"这段代码做什么"；设计文档能告诉你"为什么这么做"
+2. **强迫思考的工具**：写文档时被迫面对边界情况、被迫显式化隐性约定、被迫拍板开放问题
+3. **多轮审查的载体**：4 轮人工审查每轮都基于设计文档讨论，没有这份"共同基准"
+   讨论会发散
+
+**最重要的章节**（如果只读 3 节）：
+- `phase3_design.md §10` 已决策事项清单 — 看决策**为什么这样定**
+- `phase3_design.md §12` canonical schemas 规范 — 看契约**单一来源**
+- `phase3_design.md §11.6.2 选择 C` cost_mode 修订史 — 看一个设计**如何在审查中演化**
+
+## 四、人工审查迭代的方法论（最值得记住的一节）
+
+整个 Phase 3 设计期间走过：
+- **3 轮 supervisor 自检**（找到 7 个 critical 设计 bug）
+- **4 轮人工审查**（每轮都发现新 bug，总计 25+ 个修订）
+- **1 轮实现审查**（找到 3 个 critical 测试缺口）
+
+**关键观察**：每一轮审查发现的 bug **越来越细微**：
+- 第 1 轮：接口签名漂移、调用错误（明显）
+- 第 2 轮：跨模块契约不固化（中等）
+- 第 3 轮：源码字段对照错误、NaN 路径、事务性（细微）
+- 第 4 轮：单字漏改、措辞不精确（极细微）
+
+**这意味着**：审查迭代有"长尾效应"。继续做第 5 轮、第 6 轮 doc review 边际收益越来越低。
+**应该在某个点停下来交给 coder + 单测发现剩余 bug**。
+
+但**第 1-4 轮人工审查的价值是不可替代的**——它们捕获的 bug 大多是"语义层面"的，
+单测无法替代。例如：
+- "v3 修订把 NaN 改 fail-fast，但 4 个边界表未同步" — 语义不一致
+- "MarketContext schema §12.2 写错了 3 个字段" — 与上游源码偏离
+
+这些都需要"理解整个设计意图"才能发现，单测只能验证"代码做了什么"，验证不了
+"代码该做什么"。
+
+**给未来回看的方法论**：
+1. 设计阶段做 supervisor 自检（3 轮即可）
+2. 然后人工审查至少 3-4 轮（这是不可替代的）
+3. 实现完成后再做实现审查（发现 doc-impl drift 和测试缺口）
+4. 不要追求"零 bug 才交付"——追求"剩余 bug 在编译/单测层面更易发现"
+
+## 五、Fail-fast 不降级原则的全程贯彻
+
+整个研究分支贯穿一个原则：**暴露潜在错误，拒绝静默错误**。
+
+```
+Phase 1 fetcher：API 失败 raise（不返回空数据）
+Phase 1 store：parquet 写入用 tmp + rename（不写半成品）
+Phase 2a registry：因子重复注册 raise（不静默覆盖）
+Phase 2b walk_forward：fold 内异常 raise（不 catch 后用 zero-weight）
+Phase 2c optimizer：协方差失败 → 返回 current_weights + 显式 logger.warning
+Phase 3 _check_bankruptcy：V=NaN raise NumericalError（不静默 fillna）
+Phase 3 _validate_environment：tz/index/freq 不一致 raise ValueError（不延迟到运行时）
+Phase 3 BacktestReport.save：tmp_dir + os.replace 原子化（不留半成品）
+```
+
+**学到的具体写法**：
+- 不要 `try: ... except Exception: pass`
+- 不要 `data.fillna(0)` 除非能解释 "0 在这里语义合理"
+- 不要 `if x is None: return default` 除非显式默认是产品行为
+- 函数边界做参数校验，**早暴露 > 晚崩溃**
+
+**反面例子**（重复出现的 bug）：
+- "数据 gap → spread NaN → cost NaN → V NaN → 全部后续 bar 都是 NaN"
+- 这种 bug 在多个量化框架历史上反复出现，本项目用 `_check_bankruptcy` 的 `np.isfinite`
+  分支彻底拦截
+
+## 六、与 Phase 4 实盘分支的衔接
+
+研究分支已完成。实盘分支（Phase 4）与本项目**并列**，不是 3→4 线性依赖。
+
+**两者的共享层**：
+- Phase 1 数据采集（实盘也持续采集，复用同一 DataReader）
+- Phase 2a/2b 因子和信号（实盘用同一 FactorStore + SignalStore）
+- **Phase 2c ExecutionOptimizer**（最关键共享点：同一个 `optimize_step()` 接口
+  在回测和实盘里行为一致）
+
+**Phase 4 独有的部分**：
+- ccxt 实盘下单（替代 Phase 3 的 Rebalancer 模拟）
+- 风控守护（止损、敞口上限、熔断）
+- 监控告警（持仓 / P&L / 异常）
+- 状态恢复（实盘必须支持崩溃后从最近一次状态恢复）
+
+**Phase 3 给 Phase 4 留下的资产**：
+- `BacktestReport` 的 schema 可作为实盘日志的参考
+- `attribution` 模块可直接用于实盘绩效归因
+- `test_consistency.py` 的"四路径 impact 一致性"护栏在实盘部署前必须仍然通过
+  （任何实盘修改不得破坏向量化-事件驱动的等价性）
+
+## 七、给"未来回看的我"
+
+如果你某天打开这个项目，可能是想：
+- **重启某个阶段的开发** → 直接读对应 phase 的 study/README + docs/{phase}_design.md
+- **借鉴这个架构做新项目** → 重点看 §12 canonical schemas + §14 设计方法论
+- **复习量化基础知识** → 看 Phase 2a 进阶 + Phase 2b 第十三部分核心概念深入
+- **怀念这段开发过程** → 直接读这一章 + 各 phase 末尾的"学习完成后你应具备"
+
+**最重要的提醒**：
+- 这个项目证明了**严谨设计 + 多轮审查 + 严格测试**可以让一个人在 6-8 周内造出
+  接近私募级的研究框架
+- 但它也证明了**"边写边改"是行不通的** — 没有 4500 行 design doc + 4 轮人工审查，
+  这个 backtest_engine 不可能在 1 周内交付出可信的实现
+- 所以未来做新项目时，**不要怕花 30% 时间在设计文档上**。事实证明这是最高效的
+  时间分配
+
+---
+
+**祝研究分支学习愉快。**
+
+**Phase 4 见，或者……不见也行。这个研究分支自身已经是完整的产品。**

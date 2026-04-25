@@ -72,7 +72,7 @@ Crypto-Trading-Bot/
 │   │   ├── volatility/         #     （预留）波动率因子
 │   │   ├── orderflow/          #     （预留）订单流因子
 │   │   └── cross_asset/        #     （预留）跨标的因子
-│   └── tests/                  #   单元测试（198 项）
+│   └── tests/                  #   单元测试（200 项）
 │       ├── test_types.py
 │       ├── test_base.py
 │       ├── test_registry.py
@@ -117,7 +117,7 @@ Crypto-Trading-Bot/
 │   │   ├── tree_models.py      #     LGBMModelWrapper / XGBModelWrapper
 │   │   └── torch_base.py       #     TorchModelBase（PyTorch 基础封装）
 │   ├── utils.py                #   辅助工具（load_price_panel 等）
-│   └── tests/                  #   单元测试（166 项）
+│   └── tests/                  #   单元测试（191 项）
 │       ├── test_types.py
 │       ├── test_preprocessing.py
 │       ├── test_training.py
@@ -133,9 +133,34 @@ Crypto-Trading-Bot/
 │   ├── config.py               #   MarketContext 数据类 + 默认常量
 │   ├── cost.py                 #   动态成本表达式（commission + spread + 1.5次幂 impact）
 │   ├── optimizer.py            #   ExecutionOptimizer.optimize_step() 单步优化
-│   └── tests/                  #   单元测试（31 项）
-│       ├── test_cost.py        #     T1-T3: 成本函数数值/单调/零值
-│       └── test_optimizer.py   #     T4-T10: 可解性/成本压制/ADV/资金费率/VolTarget/Fallback/Beta
+│   └── tests/                  #   单元测试（36 项）
+│       ├── test_cost.py        #     成本函数数值/单调/零值
+│       └── test_optimizer.py   #     可解性/成本压制/ADV/资金费率/VolTarget/Fallback/Beta
+│
+├── backtest_engine/            # 第三阶段：事件驱动回测引擎
+│   ├── __init__.py             #   公开导出 EventDrivenBacktester / BacktestConfig / BacktestReport / 三模式枚举
+│   ├── config.py               #   BacktestConfig (kw_only) + RunMode/ExecutionMode/CostMode 枚举
+│   ├── context.py              #   MarketContextBuilder（DataReader → MarketContext + build_panels）
+│   ├── weights_source.py       #   WeightsSource Protocol + PrecomputedWeights + OnlineOptimizer
+│   ├── rebalancer.py           #   Rebalancer 执行模拟层（v1 仅 MARKET, cost_mode 自持）
+│   ├── pnl.py                  #   PnLTracker P&L 状态中心 + NumericalError fail-fast
+│   ├── engine.py               #   EventDrivenBacktester 顶层协调（按 RunMode 分流）
+│   ├── attribution.py          #   cost 分解 + 偏差归因 + regime 分段（纯函数）
+│   ├── report.py               #   BacktestReport 容器 + parquet/JSON 原子持久化
+│   ├── plot.py                 #   8 张标准量化回测图（matplotlib）
+│   ├── reporting.py            #   to_markdown 单文件报告生成
+│   └── tests/                  #   单元测试（219 项）
+│       ├── test_config.py      #     16 项 __post_init__ 校验
+│       ├── test_context.py     #     批量/逐步双模式 + warmup 校验
+│       ├── test_weights_source.py #  Precomputed / Online + cost_mode 自持
+│       ├── test_rebalancer.py  #     执行模拟 + ExecutionReport schema
+│       ├── test_pnl.py         #     破产双通道（V≤0 标志 / NaN-Inf 抛异常）
+│       ├── test_engine.py      #     8 项 _validate_environment + (a') (f) 早退 + 4 项稳健性链路
+│       ├── test_attribution.py #     cost_decomposition / deviation / regime / per_symbol
+│       ├── test_report.py      #     summary / to_dict / save_load 原子化
+│       ├── test_plot.py        #     8 张图返回类型 + headless
+│       ├── test_reporting.py   #     markdown 渲染 + 跨 section 缺失
+│       └── test_consistency.py #   ★ 跨模块护栏：4 处 impact 公式一致 + 零摩擦严格等价 (rtol=1e-12)
 │
 ├── db/                         # 共享数据存储（各模块通过此目录通信）
 │   ├── factors/                #   因子存储目录（FactorStore 的数据根）
@@ -1459,8 +1484,131 @@ target_w = optimizer.optimize_step(signals_t, current_w, context, prices[:t])
 
 | 测试文件 | 测试项数 | 覆盖内容 |
 |---------|---------|---------|
-| test_cost.py | 9 | T1-T3: 成本分量数值正确性（手工比对）、成本单调性、零交易零成本、逐标的冲击系数 |
-| test_optimizer.py | 22 | T4-T10: 基本可解性（无NaN/约束满足）、高成本压制交易、ADV参与率约束、资金费率影响、Vol Targeting（缩放+leverage二次检查）、Fallback路径（协方差失败/求解异常/状态非最优）、Beta-neutral路径 |
+| test_cost.py | 14 | 成本分量数值正确性（手工比对）、成本单调性、零交易零成本、逐标的冲击系数 |
+| test_optimizer.py | 22 | 基本可解性（无NaN/约束满足）、高成本压制交易、ADV参与率约束、资金费率影响、Vol Targeting（缩放+leverage二次检查）、Fallback路径（协方差失败/求解异常/状态非最优）、Beta-neutral路径 |
+
+---
+
+## 第三阶段：事件驱动回测引擎 (backtest_engine)
+
+### 概述
+
+Phase 3 是项目的**研究分支收尾模块**。它把 Phase 1-2(a/b/c) 串成完整的回测流程，
+对外暴露唯一入口 `EventDrivenBacktester().run(config)`，按 `RunMode` 分流到三种精度
+模式，统一交付 `BacktestReport`。
+
+研究分支至此完成；实盘分支（Phase 4）独立开发。
+
+### 三种 RunMode 一表看清
+
+| RunMode | 决策层 | 执行层 | 速度 / 半年 1m bar | 适用场景 |
+|---------|------|------|---------------|--------|
+| `VECTORIZED` | Phase 2b 已有的 `vectorized_backtest`（薄包装）| 仅手续费近似 | 秒级 | 因子初筛、参数扫描 |
+| `EVENT_DRIVEN_FIXED_GAMMA` | `PrecomputedWeights` 重放 SignalStore 权重面板 | Rebalancer 逐 bar 模拟 + spread/impact | 几分钟 | 评估已训练策略的执行摩擦敏感性 |
+| `EVENT_DRIVEN_DYNAMIC_COST` | `OnlineOptimizer` 每 bar 调 Phase 2c 重优化 | 同上 | ~3.5 小时（N=1） / ~1.5 小时（N=5）| 模拟实盘决策路径 |
+
+### 核心 API（极简）
+
+```python
+from backtest_engine import EventDrivenBacktester, BacktestConfig, RunMode, CostMode
+from alpha_model.core.types import PortfolioConstraints
+import pandas as pd
+
+config = BacktestConfig(
+    strategy_name="momentum_v1",            # 必须存在于 SignalStore
+    symbols=["BTC/USDT", "ETH/USDT"],
+    start=pd.Timestamp("2026-01-01", tz="UTC"),
+    end=pd.Timestamp("2026-04-01", tz="UTC"),
+    run_mode=RunMode.EVENT_DRIVEN_DYNAMIC_COST,
+    constraints=PortfolioConstraints(max_weight=0.4, dollar_neutral=True),
+    cost_mode=CostMode.FULL_COST,           # 或 MATCH_VECTORIZED 做可比性校验
+    optimize_every_n_bars=5,                # 加速：每 5 bar 重优化一次
+)
+
+report = EventDrivenBacktester().run(config)
+print(report)                               # 自定义 __repr__，~20 行摘要
+print(report.summary())                     # 20 keys（12 base + 5 cost_bp + 状态 + 偏差）
+report.plot()                               # 一键 8 张图
+report.save("./reports/run_2026_04")        # parquet + JSON 原子化
+report.to_markdown("./reports/run_2026_04_md")  # markdown + figures/
+```
+
+### 子模块职责（10 个源文件）
+
+| 文件 | 职责 |
+|------|------|
+| `config.py` | `BacktestConfig` (kw_only) + 三个枚举；`__post_init__` 16 项校验前置暴露环境问题 |
+| `context.py` | `MarketContextBuilder`：DataReader → MarketContext（逐步）+ build_panels（批量）|
+| `weights_source.py` | `WeightsSource` Protocol + `PrecomputedWeights`/`OnlineOptimizer` 两实现；cost_mode 自持 |
+| `rebalancer.py` | 执行模拟（v1 仅 MARKET）+ 三分量成本计算；cost_mode 自持，MATCH_VECTORIZED 跳 spread |
+| `pnl.py` | P&L 状态中心；混合模式（循环内时序敏感 + 循环后向量化）；破产双通道 |
+| `engine.py` | 顶层协调；`_validate_environment` 8 项校验 + (a') (f) 早退 |
+| `attribution.py` | 纯函数：cost 分解 / 偏差归因 / regime 分段 / per_symbol 按需重算 |
+| `report.py` | `BacktestReport` 容器 + summary/to_dict/save/load + plot/to_markdown 入口 |
+| `plot.py` | 8 张标准图（equity/drawdown/returns dist/cost/weights heatmap/rolling sharpe/regime/deviation）|
+| `reporting.py` | `to_markdown` Markdown 单文件报告（含图片嵌入）|
+
+### CostMode 行为映射
+
+| RunMode × CostMode | 行为 |
+|---------------------|------|
+| VECTORIZED + FULL_COST | `vectorized_backtest(spread_panel=真实)` |
+| VECTORIZED + MATCH_VECTORIZED | `vectorized_backtest(spread_panel=None)` |
+| FIXED_GAMMA + FULL_COST | Rebalancer 内部判断计 spread/2 slippage |
+| FIXED_GAMMA + MATCH_VECTORIZED | Rebalancer 内部判断不计 spread |
+| DYNAMIC_COST + FULL_COST | OnlineOptimizer 透传 raw context；Rebalancer 计 slippage |
+| DYNAMIC_COST + MATCH_VECTORIZED | OnlineOptimizer 内部 `replace(context, spread=0)`；Rebalancer 不计 |
+
+**MATCH_VECTORIZED 的唯一用途是可比性校验**——使三种 RunMode 的成本模型在底层对齐，便于偏差拆解。
+生产回测应用 FULL_COST。
+
+### 跨模块护栏：`test_consistency.py`（关键）
+
+无策略可上线 → 无集成测试 → 单测必须严格抓住"未来重构破坏 invariant"的回归。
+专门的 `test_consistency.py` 模块集中三大数值精度护栏（rtol=1e-12）：
+
+| 护栏 | 验证 |
+|------|------|
+| **TestZeroFrictionEquivalence** | 关闭 fee/spread/impact/funding 后，FIXED_GAMMA 与 VECTORIZED 的 returns/equity 严格相等 |
+| **TestPerSymbolCostSumsToPortfolioViaEngine** | engine 路径下 `compute_per_symbol_cost` 三分量加总 == `cost_decomposition` portfolio total |
+| **TestImpactFormulaFourPathsConsistency** | impact 公式 `(2/3)·coeff·σ·√(V/ADV)·|Δw|^1.5` 在四处实现两两相等：cvxpy / vectorized panel / Rebalancer scalar / per-symbol 重算 |
+
+任何一处 impact 公式漂移、任何一处 cost_mode 分支语义改变，护栏立即失败。
+
+### Fail-fast 设计
+
+数值异常**必须暴露**，不允许 NaN 静默传播：
+
+| 触发条件 | 暴露方式 |
+|---------|--------|
+| `V ≤ 0`（finite，策略亏光）| 标志 `is_bankrupt=True` + `bankruptcy_timestamp`，engine break，equity_curve 截断 |
+| `V` 是 NaN / Inf（数据/公式 bug）| `_check_bankruptcy` 立即抛 `NumericalError`，事件循环中止 |
+| funding_rates_panel.index tz ≠ UTC | `_validate_environment` 抛 `ValueError`（防 funding 静默漏扣） |
+| price_panel.index ⊉ bar_timestamps | 同上（防 weights_history 算 NaN gross） |
+| price_panel 推断频率 ≠ config.bar_freq | 同上（防 impact 公式 bars_per_day 算错） |
+
+### v1 已知边界
+
+- **不建模强平**：合约保证金率破线时实盘会强平，v1 仅看 V≤0 → 已知乐观偏差，在偏差拆解表显式列出
+- **仅 MARKET 执行模式**：LIMIT/TWAP 推 v2（需 tick 仿真 + 跨 bar pending state，复杂度跳一级）
+- **universe 固定**：v1 不支持中途加/减 symbol（已在 §11.6.5 reindex 兜底为 v2 留位）
+- **断点重连**：v1 不做（半年回测 ~3.5h，加速参数已大幅缓解；主流框架 zipline/backtrader/vnpy 均不内置）
+
+### Phase 3 测试覆盖（219 项）
+
+| 测试文件 | 测试项数 | 覆盖内容 |
+|---------|---------|---------|
+| test_config.py | 28 | 16 项 __post_init__ 校验（含 v3 修订 tz-aware、regime_series tz、optimize_every_n_bars） |
+| test_context.py | 26 | MarketContext 字段完整性、批量/逐步双模式、warmup 校验、build_panels keys |
+| test_weights_source.py | 18 | Precomputed schema 严格化、Online cost_mode 自持、fallback 透传 |
+| test_rebalancer.py | 24 | 三分量成本数值、最小下单量过滤、cost_mode 分支、ExecutionReport canonical schema |
+| test_pnl.py | 31 | 破产双通道（V≤0 标志 / NaN/Inf 异常）、apply_funding/record 时序、向量化重算与循环内一致性 |
+| test_engine.py | 23 | 8 项 _validate_environment、(a')/(f) 双早退、optimize_every_n_bars、4 项稳健性链路（A4/G1/G4/H4） |
+| test_attribution.py | 24 | cost_decomposition keys/bp/share/funding 一阶近似、regime ffill/min_bars、deviation P1/P2 双模式、per_symbol 加总恒等 |
+| test_report.py | 23 | summary 20 keys、to_dict NaN 处理、save_load 原子化（tmp+rename）、context_panels 跨机器分发 |
+| test_plot.py | 13 | 8 张图返回类型、ax 注入、headless 兼容 |
+| test_reporting.py | 7 | markdown 渲染、figures 目录、可选 section 跳过、Bankruptcy warning |
+| **test_consistency.py** | **9** | **★ 跨模块/跨模式 数值一致性护栏（rtol=1e-12）：4 路径 impact、零摩擦严格等价、per-symbol 加总** |
 
 ---
 
@@ -1470,17 +1618,21 @@ target_w = optimizer.optimize_step(signals_t, current_w, context, prices[:t])
 # 第一阶段测试（125 项）
 python -m pytest data_infra/tests/ -v
 
-# 第二阶段(a) 测试（198 项）
+# 第二阶段(a) 测试（200 项）
 python -m pytest factor_research/tests/ -v
 
-# 第二阶段(b) 测试（166 项）
+# 第二阶段(b) 测试（191 项）
 python -m pytest alpha_model/tests/ -v
 
-# 第二阶段(c) 测试（31 项）
+# 第二阶段(c) 测试（36 项）
 python -m pytest execution_optimizer/tests/ -v
 
-# 全部测试
-python -m pytest data_infra/tests/ factor_research/tests/ alpha_model/tests/ execution_optimizer/tests/ -v  # 预期 646 项全通过
+# 第三阶段测试（219 项，含 9 项跨模块护栏）
+python -m pytest backtest_engine/tests/ -v
+
+# 全部测试（研究分支总计 771 项）
+python -m pytest data_infra/tests/ factor_research/tests/ alpha_model/tests/ \
+                 execution_optimizer/tests/ backtest_engine/tests/ -v
 ```
 
 ### Phase 2b 测试覆盖
@@ -1551,6 +1703,40 @@ python -m pytest data_infra/tests/ factor_research/tests/ alpha_model/tests/ exe
 - **ADV 参与率约束**：`|Δw_i| × V ≤ participation × ADV_i`，防止单步冲击市场
 - **约束零重复**：直接复用 `alpha_model.portfolio.constraints.build_constraints`
 - **三路 Fallback**：协方差失败/求解异常/状态非最优 → 返回 current_weights，宁可不交易不可崩溃
+
+### 第三阶段
+- **三 RunMode 统一入口**：用户只切 `run_mode` 一个字段在 VECTORIZED / FIXED_GAMMA / DYNAMIC_COST 间切换；不学三套 API
+- **WeightsSource Protocol 抽象**：把"决策从哪来"收敛到一个接口；为 v2 SingleAssetTiming 留扩展点
+- **PnLTracker 混合模式**：循环内维护时序敏感状态（V / funding / weights / cost），循环后向量化算 equity 和 12 项绩效；最大化精度与速度
+- **破产双通道**：`V≤0 finite` 用标志位 + break（保留截断 equity_curve 供分析）；`V=NaN/Inf` 抛 `NumericalError` fail-fast（防止数据 bug 让全部后续 bar 都是 NaN）
+- **cost_mode 由消费方各自持有**：经过两轮人工审查从"engine mediator"重构为"Rebalancer/OnlineOptimizer 各自持有 cost_mode"，消除跨模块隐性约定，每个模块独立可测
+- **funding 命名严格分离**：engine 侧 `funding_rates_panel: pd.DataFrame`（原始）vs PnLTracker 内部 `funding_events: pd.Series`（已结算事件聚合）；详见 docs/phase3_design.md §12.4
+- **canonical schemas 单一来源**：12 个 dict-like / dataclass / DataFrame 的 keys 列表全部固化在 §12，跨模块契约只此一处定义
+- **持久化 parquet + JSON 路线**：放弃 pickle（跨 Python/pandas 版本不稳）；`save` 用 `tmp + os.replace` 原子化
+- **`schema_version` 演进控制**：`load` 时校验主版本兼容性，为 v2 演进留迁移空间
+- **Fail-fast 不降级原则**：所有上游环境问题（tz mismatch / index 缺失 / freq 不符）在 `_validate_environment` 前置暴露；NaN 在 `_check_bankruptcy` 直接抛异常，绝不静默 fillna(0)
+- **可比性校验为头等护栏**：`test_consistency.py` 集中三大 rtol=1e-12 护栏（impact 公式四路径一致 / 零摩擦严格等价 / per-symbol 加总恒等），无策略可上线场景下的核心质量保证
+
+---
+
+## 项目阶段路线图
+
+```
+研究分支（已完成）                    实盘分支（独立开发）
+─────────────────────────             ─────────────────────
+Phase 1  data_infra        ✅
+   ↓                                   Phase 4  实盘交易系统  🚧
+Phase 2a factor_research   ✅              （ccxt 实盘下单 + 风控守护
+   ↓                                        + 监控告警 + Phase 2c 直接复用 +
+Phase 2b alpha_model       ✅                 Phase 1 数据继续采集）
+   ↓
+Phase 2c execution_optimizer ✅
+   ↓
+Phase 3  backtest_engine   ✅
+（研究分支至此完成 — 因子→策略→回测全链路打通）
+```
+
+**研究分支与实盘分支的并列关系**：两者都依赖 Phase 1-2(a/b/c)；Phase 3 与 Phase 4 共享 `ExecutionOptimizer.optimize_step()` 接口（同一动态成本优化在回测和实盘里行为一致）。
 
 ## 交易对
 
