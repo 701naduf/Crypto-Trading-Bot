@@ -413,7 +413,12 @@ class TestComputePerSymbolCost:
             min_trade_value=0.001, fee_rate=0.0004, impact_coeff=0.1,
         )
         portfolio_fee, portfolio_spread, portfolio_impact = 0.0, 0.0, 0.0
-        for i in range(1, n):
+        # Step 4 修订：从 i=0 开始（含首 bar），current_w 初始为 0
+        # 与 compute_per_symbol_cost 用 shift(1, fill_value=0.0) 一致
+        for i in range(n):
+            cw_for_step = (
+                pd.Series(0.0, index=symbols) if i == 0 else weights.iloc[i-1]
+            )
             ctx = MarketContext(
                 timestamp=ts[i], symbols=symbols,
                 spread=pd.Series([0.0005, 0.0005], index=symbols),
@@ -422,7 +427,7 @@ class TestComputePerSymbolCost:
                 portfolio_value=10000.0, funding_rate=None,
             )
             _, report = r.execute(
-                weights.iloc[i-1], weights.iloc[i], ctx, pd.Series(),
+                cw_for_step, weights.iloc[i], ctx, pd.Series(),
             )
             portfolio_fee += report.fee_cost
             portfolio_spread += report.spread_cost
@@ -593,3 +598,96 @@ class TestDeviationP2ResidualZero:
         np.testing.assert_allclose(
             ed_base.equity_curve.values, reconstructed.values, rtol=1e-12,
         )
+
+
+# ---------------------------------------------------------------------------
+# Step 4 (A3/M2): per-symbol 严格 invariant — 含 funding + 第 1 bar 非零调仓 + V 大幅波动
+# ---------------------------------------------------------------------------
+
+class TestPerSymbolStrictInvariant:
+    """A3 + M2 关键护栏：per-symbol 加总 == portfolio total，rtol=1e-12
+
+    Step 4 修订：
+      - weights_history.shift(1, fill_value=0.0) 包含首 bar 调仓
+      - 用 v_at_bar_open_history（PnLTracker 实例字段）替代 portfolio_value_history.shift(1)
+        消除"V_prev 与 Rebalancer 看到的 V 不一致"的 1-bar 偏移误差
+    """
+
+    def test_per_symbol_sums_to_portfolio_strict(self):
+        """含 funding + 第 1 bar 非零调仓 + V 波动：rtol=1e-12 严格成立"""
+        symbols = ["BTC/USDT", "ETH/USDT"]
+        n = 5
+        ts = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+        rng = np.random.default_rng(42)
+
+        # 首 bar 非零调仓 [0.4, -0.4]；后续小幅调整
+        weights_arr = rng.normal(0, 0.05, (n, 2))
+        weights_arr[0] = [0.4, -0.4]
+        weights = pd.DataFrame(weights_arr, index=ts, columns=symbols)
+
+        prices = pd.DataFrame(
+            100 * np.exp(np.cumsum(rng.normal(0, 0.01, (n, 2)), axis=0)),
+            index=ts, columns=symbols,
+        )
+
+        # 跑 PnLTracker：含一个 funding event 让 V 跳变
+        from backtest_engine.rebalancer import Rebalancer
+        from backtest_engine.config import ExecutionMode, CostMode
+        from execution_optimizer import MarketContext
+
+        spread = 0.0005
+        sigma = 0.03
+        adv = 1e9
+        coeff = 0.1
+        fee_rate = 0.0004
+        V0 = 10000.0
+
+        tracker = PnLTracker(V0)
+        r = Rebalancer(
+            execution_mode=ExecutionMode.MARKET, cost_mode=CostMode.FULL_COST,
+            min_trade_value=0.0001, fee_rate=fee_rate, impact_coeff=coeff,
+        )
+        cw = pd.Series([0.0, 0.0], index=symbols)
+        for i, t in enumerate(ts):
+            # bar 2 funding event（让 V 大幅缩水）
+            if i == 2:
+                tracker.apply_funding_settlement(
+                    t, cw, pd.Series([0.05, 0.05], index=symbols),  # 5% × 2
+                )
+            ctx = MarketContext(
+                timestamp=t, symbols=symbols,
+                spread=pd.Series([spread] * 2, index=symbols),
+                volatility=pd.Series([sigma] * 2, index=symbols),
+                adv=pd.Series([adv] * 2, index=symbols),
+                portfolio_value=tracker.portfolio_value,
+                funding_rate=None,
+            )
+            tw = weights.iloc[i]
+            actual_w, exec_report = r.execute(cw, tw, ctx, prices.iloc[i])
+            tracker.record(t, actual_w, prices.iloc[i], exec_report)
+            cw = actual_w
+
+        # portfolio total（来自 PnLTracker）
+        cost_decomp = cost_decomposition(tracker, 525960)
+
+        # per-symbol total（来自 compute_per_symbol_cost，用 v_at_bar_open_history）
+        spread_panel = pd.DataFrame([[spread] * 2] * n, index=ts, columns=symbols)
+        adv_panel = pd.DataFrame([[adv] * 2] * n, index=ts, columns=symbols)
+        vol_panel = pd.DataFrame([[sigma] * 2] * n, index=ts, columns=symbols)
+
+        # 用实际跑出的 weights_history 而非原始 weights（min_trade_value 过滤后可能略有不同）
+        wh = pd.DataFrame(tracker._weights_history).T.sort_index()
+
+        per_sym = compute_per_symbol_cost(
+            weights_history=wh,
+            spread_panel=spread_panel, adv_panel=adv_panel, vol_panel=vol_panel,
+            fee_rate=fee_rate, impact_coeff=coeff,
+            v_at_bar_open_history=tracker.v_at_bar_open_history,   # ★ Step 4
+        )
+
+        # 严格 invariant: per-symbol total == portfolio total
+        for k in ("fee", "spread", "impact"):
+            np.testing.assert_allclose(
+                per_sym[k].sum().sum(), cost_decomp["absolute"][k], rtol=1e-12,
+                err_msg=f"per-symbol {k} sum != portfolio total",
+            )

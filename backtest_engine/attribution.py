@@ -455,13 +455,23 @@ def compute_per_symbol_cost(
     vol_panel: pd.DataFrame,
     fee_rate: float,
     impact_coeff: float | pd.Series,
-    portfolio_value_history: pd.Series,
+    portfolio_value_history: pd.Series | None = None,
+    v_at_bar_open_history: pd.Series | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
     按需重算 per-symbol cost（D3 A+ 折中方案）
 
     公式必须与 Rebalancer / cost.py / vectorized.py 一致（§11.4 选择 D），
     否则 per-symbol 加总 ≠ portfolio 总。
+
+    Step 4 / A3 / M2 (v6 修订):
+      - 使用 weights_history.shift(1, fill_value=0.0) 包含首 bar 调仓（事件循环
+        i=0 时 current_w=0，target_w=weights[0] 通常非零 → 真实 fee/spread/impact 非零）
+      - 推荐使用 v_at_bar_open_history（PnLTracker.v_at_bar_open_history property）：
+        每 bar Rebalancer 看到的 V，与运行时 impact 公式严格一致（rtol=1e-12 invariant）。
+      - portfolio_value_history（旧形参，向后兼容）：每 bar 末尾的 V，用 shift(1)
+        取上一步 V 算 impact。**精度低于 v_at_bar_open_history**（差一个
+        (1+gross-funding-cost) 因子），仅作 v3 之前用法的兼容路径。
 
     Args:
         weights_history:         timestamp × symbol 权重历史
@@ -470,15 +480,24 @@ def compute_per_symbol_cost(
         vol_panel:               timestamp × symbol，日化 σ
         fee_rate:                taker 手续费率
         impact_coeff:            float 或 pd.Series(index=symbols)
-        portfolio_value_history: 每 bar 末尾 V（用 shift(1) 取上一步 V 算 impact）
+        portfolio_value_history: （向后兼容）每 bar 末尾 V；shift(1) 取上一步 V 算 impact
+        v_at_bar_open_history:   （v6 推荐）每 bar 开始时 V，与 Rebalancer 公式严格一致
 
     Returns:
         {"fee": DataFrame, "spread": DataFrame, "impact": DataFrame}
     """
-    delta_w = weights_history.diff()
+    if v_at_bar_open_history is None and portfolio_value_history is None:
+        raise ValueError(
+            "compute_per_symbol_cost: 必须传 v_at_bar_open_history（推荐）"
+            "或 portfolio_value_history（向后兼容）"
+        )
+
+    # Step 4 / A3：用 shift(1, fill_value=0.0) 包含首 bar
+    # （事件循环 i=0 时 current_w=0；首 bar 调仓真实 fee/spread/impact 非零）
+    delta_w = weights_history - weights_history.shift(1, fill_value=0.0)
     abs_dw = delta_w.abs()
     symbols = list(weights_history.columns)
-    idx = delta_w.index
+    idx = weights_history.index
 
     # 对齐面板到 weights_history 索引
     spread_aligned = spread_panel.reindex(idx)[symbols]
@@ -491,12 +510,20 @@ def compute_per_symbol_cost(
     # 2. spread per symbol = spread/2 × |Δw|
     spread = spread_aligned / 2.0 * abs_dw
 
-    # 3. impact per symbol = (2/3) × coeff × σ × √(V_prev/ADV) × |Δw|^1.5
-    V_prev = portfolio_value_history.shift(1).reindex(idx)
+    # 3. impact per symbol = (2/3) × coeff × σ × √(V/ADV) × |Δw|^1.5
+    # M2 (v6) 优先用 v_at_bar_open_history（精确，与 Rebalancer 一致）
+    if v_at_bar_open_history is not None:
+        V_for_impact = v_at_bar_open_history.reindex(idx)
+    else:
+        # 向后兼容路径：portfolio_value_history.shift(1)；首 bar 用首条已记录 V
+        V_for_impact = portfolio_value_history.shift(1).reindex(idx)
+        if len(V_for_impact) > 0 and pd.isna(V_for_impact.iloc[0]):
+            V_for_impact.iloc[0] = portfolio_value_history.iloc[0]
+
     # ADV 兜底（Z4/Z12 跨四处统一 + NaN warning）
     from alpha_model.backtest.adv_helpers import safe_adv_panel
     adv_safe = safe_adv_panel(adv_aligned, context="compute_per_symbol_cost")
-    sqrt_ratio = np.sqrt(V_prev.values[:, None] / adv_safe.values)
+    sqrt_ratio = np.sqrt(V_for_impact.values[:, None] / adv_safe.values)
 
     if isinstance(impact_coeff, pd.Series):
         coeff_arr = impact_coeff.reindex(symbols).values.astype(float)
@@ -509,7 +536,7 @@ def compute_per_symbol_cost(
     )
     impact = pd.DataFrame(impact_arr, index=idx, columns=symbols)
 
-    # 第一行的 delta_w 是 NaN（diff 首行）；其余对应 V_prev=NaN 也 NaN — fillna(0)
+    # 兜底（vol warmup NaN 等合法 NaN）：fillna(0)
     return {
         "fee":    fee.fillna(0.0),
         "spread": spread.fillna(0.0),

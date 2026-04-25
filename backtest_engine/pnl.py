@@ -87,6 +87,10 @@ class PnLTracker:
         self._spread_series: dict[pd.Timestamp, float] = {}
         self._impact_series: dict[pd.Timestamp, float] = {}
         self._portfolio_value_history: dict[pd.Timestamp, float] = {}
+        # Step 4 / M2：record() 入口时的 V（即 Rebalancer 用于 impact 公式 √(V/ADV) 的 V）
+        # 用于 compute_per_symbol_cost 精确重算 per-symbol impact，与运行时严格一致。
+        # （funding 应用后、record 修改 V 之前的 V，等价于"本 bar Rebalancer 看到的 context.V"）
+        self._v_at_bar_open: dict[pd.Timestamp, float] = {}
 
         # 离散事件 / 统计
         self._funding_events: dict[pd.Timestamp, float] = {}
@@ -144,6 +148,12 @@ class PnLTracker:
         exec_report: ExecutionReport,
     ) -> None:
         """每 bar 末尾调用：算 gross + cost + funding，更新 V，记录所有时序"""
+        # ── Step 0 (M2 / Step 4 v6): 记录 record() 入口时的 V ──
+        # 此时 self._V 已被 funding 应用过（如果有），但还未被本 bar gross/cost 改动
+        # → 与 Rebalancer/Optimizer 在 (b)-(d) 期间看到的 context.V 一致
+        # 用于 compute_per_symbol_cost 精确重算 per-symbol impact
+        self._v_at_bar_open[t] = self._V
+
         # ── Step 1: 算本步 gross ──
         if self._prev_actual_w is None:
             gross_rate = 0.0
@@ -328,3 +338,13 @@ class PnLTracker:
     def portfolio_value_history(self) -> pd.Series:
         """每 bar 末尾 V"""
         return pd.Series(self._portfolio_value_history, dtype=float).sort_index()
+
+    @property
+    def v_at_bar_open_history(self) -> pd.Series:
+        """每 bar 开始时（funding 应用后、record 改动前）的 V，
+        即 Rebalancer/Optimizer 用于 impact 公式 √(V/ADV) 的 V。
+
+        Step 4 / M2：让 compute_per_symbol_cost 用此 series 精确重算 per-symbol impact，
+        与运行时 portfolio total 严格一致（rtol=1e-12）。
+        """
+        return pd.Series(self._v_at_bar_open, dtype=float).sort_index()
