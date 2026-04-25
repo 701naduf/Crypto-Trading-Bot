@@ -12,11 +12,13 @@ backtest_engine — Phase 3 事件驱动回测引擎
 from backtest_engine.config import (
     BacktestConfig, RunMode, ExecutionMode, CostMode,
 )
+from backtest_engine.engine import EventDrivenBacktester
 from backtest_engine.report import BacktestReport
 
 __all__ = [
     "BacktestConfig",
     "BacktestReport",
+    "EventDrivenBacktester",
     "RunMode",
     "ExecutionMode",
     "CostMode",

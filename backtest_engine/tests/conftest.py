@@ -206,3 +206,67 @@ def base_config(synthetic_symbols, synthetic_period):
         end=end,
         run_mode=RunMode.VECTORIZED,
     )
+
+
+# ---------------------------------------------------------------------------
+# 合成 SignalStore — 为 engine 测试构造完整 strategy 数据
+# ---------------------------------------------------------------------------
+
+def _make_synthetic_weights(symbols, idx, seed=0):
+    """合成 weights：慢速演化的 dollar-neutral 持仓"""
+    rng = np.random.default_rng(seed)
+    n_t = len(idx)
+    raw = rng.normal(0, 0.1, (n_t, len(symbols)))
+    # 平滑（rolling mean 窗口 60）
+    df = pd.DataFrame(raw, index=idx, columns=symbols).rolling(60, min_periods=1).mean()
+    # 使每行 dollar-neutral（中心化）
+    df = df.sub(df.mean(axis=1), axis=0)
+    # cap 到 [-0.4, 0.4]
+    df = df.clip(-0.4, 0.4)
+    return df.fillna(0.0)
+
+
+def _make_synthetic_signals(symbols, idx, seed=42):
+    """合成 raw signals：时序去相关的截面信号"""
+    rng = np.random.default_rng(seed)
+    raw = rng.normal(0, 1.0, (len(idx), len(symbols)))
+    df = pd.DataFrame(raw, index=idx, columns=symbols)
+    return df
+
+
+@pytest.fixture
+def synthetic_signal_store(tmp_path_factory, synthetic_symbols, synthetic_period):
+    """
+    构造一个临时 SignalStore，含一个 synthetic strategy:
+      - weights.parquet
+      - signals.parquet
+      - meta.json
+    """
+    from alpha_model.store.signal_store import SignalStore
+    from alpha_model.core.types import (
+        ModelMeta, TrainConfig, PortfolioConstraints,
+    )
+
+    _earliest, start, end = synthetic_period
+    base_dir = tmp_path_factory.mktemp("signal_store")
+    store = SignalStore(base_dir=base_dir)
+
+    idx = pd.date_range(start, end, freq="1min", tz="UTC")
+    weights = _make_synthetic_weights(synthetic_symbols, idx, seed=0)
+    signals = _make_synthetic_signals(synthetic_symbols, idx, seed=42)
+    meta = ModelMeta(
+        name="synthetic_test",
+        factor_names=["dummy_factor"],
+        target_horizon=10,
+        train_config=TrainConfig(),
+        constraints=PortfolioConstraints(),
+    )
+
+    store.save(
+        strategy_name="synthetic_test",
+        weights=weights,
+        signals=signals,
+        meta=meta,
+        performance={"sharpe": 1.5},
+    )
+    return store
