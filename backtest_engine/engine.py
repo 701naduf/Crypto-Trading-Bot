@@ -70,8 +70,13 @@ def _normalize_freq(s: str | None) -> str | None:
 
 @dataclass
 class _BacktestDependencies:
-    """私有依赖容器；engine 装配后传给 _run_* 方法"""
-    config: BacktestConfig
+    """私有依赖容器；engine 装配后传给 _run_* 方法
+
+    Step 15 / D1 / N2: 删除 dead fields config + optimizer
+      - config: _run_* 方法都显式接 config 参数，容器存一份冗余
+      - optimizer: OnlineOptimizer 内部已持有同一 ExecutionOptimizer 引用，
+        deps.optimizer 仅在 _build_dependencies 内被赋值，无外部消费
+    """
     reader: DataReader
     context_builder: MarketContextBuilder
     bar_timestamps: pd.DatetimeIndex
@@ -82,7 +87,6 @@ class _BacktestDependencies:
     weights_source: WeightsSource | None = None
     rebalancer: Rebalancer | None = None
     pnl_tracker: PnLTracker | None = None
-    optimizer: ExecutionOptimizer | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +273,7 @@ class EventDrivenBacktester:
         )
 
         deps = _BacktestDependencies(
-            config=config, reader=reader, context_builder=context_builder,
+            reader=reader, context_builder=context_builder,
             bar_timestamps=bar_timestamps,
             price_panel=price_panel,
             funding_rates_panel=funding_rates_panel,
@@ -293,7 +297,8 @@ class EventDrivenBacktester:
             sliced = weights_panel.loc[config.start:config.end]
             deps.weights_source = PrecomputedWeights(sliced)
         else:  # DYNAMIC_COST
-            deps.optimizer = ExecutionOptimizer(
+            # Step 15 / N2: optimizer 局部变量，不存 deps（OnlineOptimizer 内部已持有引用）
+            optimizer = ExecutionOptimizer(
                 constraints=config.constraints,
                 impact_coeff=config.impact_coeff,
                 fee_rate=config.fee_rate,
@@ -303,7 +308,7 @@ class EventDrivenBacktester:
             signals_panel = signal_store.load_signals(config.strategy_name)
             sliced = signals_panel.loc[config.start:config.end]
             deps.weights_source = OnlineOptimizer(
-                deps.optimizer, sliced, cost_mode=config.cost_mode,
+                optimizer, sliced, cost_mode=config.cost_mode,
             )
 
         return deps
